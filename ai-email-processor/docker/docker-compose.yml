@@ -1,0 +1,43 @@
+# docker/docker-compose.yml
+version: '3.8'
+
+services:
+  email-processor:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ai-email-processor
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../logs:/app/logs
+      - ../.env:/app/.env:ro
+    networks:
+      - ai-matching-network
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai-matching-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../sql:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - ai-matching-network
+
+volumes:
+  postgres_data:
+
+
+networks:
+  ai-matching-network:
+    driver: bridge
