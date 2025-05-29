@@ -1,7 +1,5 @@
 # src/scheduler.py
 import asyncio
-import schedule
-import time
 from datetime import datetime
 import logging
 from typing import Optional
@@ -28,28 +26,23 @@ class EmailScheduler:
         except Exception as e:
             logger.error(f"Error in email processing job: {e}")
 
-    def start(self):
-        """スケジューラーを開始"""
+    async def start_async(self):
+        """スケジューラーを開始 (非同期)"""
         self.is_running = True
-
-        # スケジュールを設定
-        schedule.every(self.interval_minutes).minutes.do(
-            lambda: asyncio.create_task(self.run_job())
-        )
-
         logger.info(
             f"Email scheduler started. Running every {self.interval_minutes} minutes."
         )
 
         # 最初の実行
-        asyncio.create_task(self.run_job())
+        await self.run_job()
 
         # スケジュールループ
         while self.is_running:
-            schedule.run_pending()
-            time.sleep(1)
+            await asyncio.sleep(self.interval_minutes * 60)
+            if self.is_running: # 再度確認 (stopが呼ばれた場合のため)
+                await self.run_job()
 
     def stop(self):
         """スケジューラーを停止"""
         self.is_running = False
-        logger.info("Email scheduler stopped.")
+        logger.info("Email scheduler stopping...")
