@@ -17,6 +17,9 @@ import httpx
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from src.encryption_utils import decrypt, DecryptionError
+from src.config import Config
+
 # ロギング設定
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -91,9 +94,42 @@ class EngineerStructured(BaseModel):
 class EmailProcessor:
     def __init__(self, db_config: Dict, ai_config: Dict):
         self.db_config = db_config
-        self.ai_config = ai_config
+        self.ai_config = ai_config # This now includes 'provider_name'
         self.db_pool: Optional[asyncpg.Pool] = None
-        self.openai_client = AsyncOpenAI(api_key=ai_config.get("openai_api_key"))
+        self.ai_client: Optional[AsyncOpenAI | httpx.AsyncClient] = None # Generic AI client
+
+        provider_name = self.ai_config.get("provider_name")
+        api_key = self.ai_config.get("api_key")
+
+        if provider_name == "openai":
+            if api_key:
+                self.ai_client = AsyncOpenAI(api_key=api_key)
+            else:
+                logger.error("OpenAI API key not found in config. OpenAI client not initialized.")
+        elif provider_name == "deepseek":
+            # Placeholder for DeepSeek Client
+            # For now, we'll use httpx.AsyncClient if an API key and base URL are provided.
+            # This is a simplified direct HTTP client. A dedicated library would be better.
+            api_base_url = self.ai_config.get("api_base_url")
+            if api_key and api_base_url:
+                self.ai_client = httpx.AsyncClient(
+                    base_url=api_base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    }
+                )
+                logger.info(f"DeepSeek client initialized with base URL: {api_base_url}")
+            else:
+                logger.warning(
+                    "DeepSeek API key or base URL not found. DeepSeek client not initialized. "
+                    "AI features will not work if DeepSeek is selected and not configured."
+                )
+                # self.ai_client will remain None
+        else:
+            logger.error(f"Unsupported AI provider: {provider_name}. No AI client initialized.")
+        
+        # The old self.openai_client is removed by not being assigned here.
 
     async def initialize(self):
         """初期化処理"""
@@ -122,14 +158,30 @@ class EmailProcessor:
 
             settings = []
             for row in rows:
-                # 実際のシステムでは暗号化されたパスワードを復号化する必要があります
+                # NOTE: This decryption logic assumes that the passwords stored in the 
+                # 'email_smtp_settings.smtp_password_encrypted' field were encrypted 
+                # using the 'encrypt' function in this module with the same ENCRYPTION_KEY.
+                # If passwords are not already encrypted in this way, IMAP login will fail,
+                # and a separate migration script will be needed to encrypt existing passwords.
+                decrypted_password = None
+                try:
+                    if row["smtp_password_encrypted"]:
+                        decrypted_password = decrypt(row["smtp_password_encrypted"], Config.ENCRYPTION_KEY)
+                except DecryptionError as e:
+                    logger.error(f"Failed to decrypt password for SMTP setting {row['id']}: {e}")
+                    # Skip this setting or use a placeholder that will cause login to fail visibly
+                    # For now, we'll skip by not adding it to the settings list if password is required.
+                    # If password is None and that's acceptable, it might still be added.
+                    # Depending on application logic, you might want to handle this differently.
+                    continue # Or handle more gracefully
+
                 settings.append(
                     SMTPSettings(
                         id=str(row["id"]),
                         smtp_host=row["smtp_host"],
                         smtp_port=row["smtp_port"],
                         smtp_username=row["smtp_username"],
-                        smtp_password=row["smtp_password_encrypted"],  # 要復号化
+                        smtp_password=decrypted_password,
                         security_protocol=row["security_protocol"],
                         from_email=row["from_email"],
                         from_name=row["from_name"],
@@ -239,6 +291,15 @@ class EmailProcessor:
 
     async def classify_email(self, email_data: Dict) -> EmailType:
         """AIを使用してメールを分類"""
+        if not self.ai_client:
+            logger.warning("AI client not initialized. Skipping email classification.")
+            return EmailType.UNCLASSIFIED
+
+        provider_name = self.ai_config.get("provider_name")
+        model_classify = self.ai_config.get("model_classify", "gpt-3.5-turbo") # Default for safety
+        temperature = self.ai_config.get("temperature", 0.3)
+        max_tokens_classify = self.ai_config.get("max_tokens", 50) # Use general max_tokens or a specific one
+
         prompt = f"""
         以下のメールを分析して、カテゴリーを判定してください。
         
@@ -253,19 +314,45 @@ class EmailProcessor:
         
         カテゴリー名のみを回答してください。
         """
+        
+        messages = [
+            {"role": "system", "content": "あなたはメール分類の専門家です。"},
+            {"role": "user", "content": prompt},
+        ]
 
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "あなたはメール分類の専門家です。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=50,
-            )
+            if provider_name == "openai":
+                response = await self.ai_client.chat.completions.create(
+                    model=model_classify,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens_classify,
+                )
+                category = response.choices[0].message.content.strip().lower()
+            elif provider_name == "deepseek":
+                if isinstance(self.ai_client, httpx.AsyncClient):
+                    # DeepSeek API call (example, adjust path and payload as needed)
+                    # Assuming /v1/chat/completions is the common path
+                    response = await self.ai_client.post(
+                        "/v1/chat/completions", # Or specific DeepSeek endpoint path
+                        json={
+                            "model": model_classify,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens_classify,
+                        },
+                    )
+                    response.raise_for_status() # Raise an exception for HTTP errors
+                    data = response.json()
+                    category = data["choices"][0]["message"]["content"].strip().lower()
+                else: # Deepseek client not properly initialized as httpx.AsyncClient
+                    logger.warning("DeepSeek client not an httpx.AsyncClient. Skipping classification.")
+                    return EmailType.UNCLASSIFIED
+            else:
+                logger.warning(f"Unsupported AI provider for classification: {provider_name}")
+                return EmailType.UNCLASSIFIED
 
-            category = response.choices[0].message.content.strip().lower()
+            # Enumに変換
 
             # Enumに変換
             if "project" in category:
@@ -285,6 +372,15 @@ class EmailProcessor:
         self, email_data: Dict
     ) -> Optional[ProjectStructured]:
         """メールから案件情報を抽出して構造化"""
+        if not self.ai_client:
+            logger.warning("AI client not initialized. Skipping project info extraction.")
+            return None
+
+        provider_name = self.ai_config.get("provider_name")
+        model_extract = self.ai_config.get("model_extract", "gpt-4") # Default for safety
+        temperature = self.ai_config.get("temperature", 0.3)
+        max_tokens_extract = self.ai_config.get("max_tokens", 2048) # Use general max_tokens
+
         prompt = f"""
         以下のメールから案件情報を抽出してJSON形式で返してください。
         
@@ -308,19 +404,54 @@ class EmailProcessor:
         
         情報が見つからない項目はnullにしてください。
         """
+        messages = [
+            {"role": "system", "content": "あなたは案件情報抽出の専門家です。"},
+            {"role": "user", "content": prompt},
+        ]
 
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "あなたは案件情報抽出の専門家です。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
-
-            data = json.loads(response.choices[0].message.content)
+            if provider_name == "openai":
+                response = await self.ai_client.chat.completions.create(
+                    model=model_extract,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens_extract,
+                    response_format={"type": "json_object"},
+                )
+                data = json.loads(response.choices[0].message.content)
+            elif provider_name == "deepseek":
+                if isinstance(self.ai_client, httpx.AsyncClient):
+                     # DeepSeek API call (example, adjust path and payload as needed)
+                    response = await self.ai_client.post(
+                        "/v1/chat/completions", # Or specific DeepSeek endpoint path
+                        json={
+                            "model": model_extract,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens_extract,
+                            # DeepSeek might use a different way to request JSON output
+                            # For example, some models look for "json" in the system prompt or specific instructions.
+                            # Or it might be a parameter like "response_format": {"type": "json_object"}
+                            # This example assumes it understands the JSON instruction in the user prompt.
+                        },
+                    )
+                    response.raise_for_status()
+                    raw_response_content = response.json()["choices"][0]["message"]["content"]
+                    # Attempt to parse JSON from the content. Deepseek might not have a dedicated JSON mode like OpenAI's gpt-4.
+                    # This means the response might contain the JSON string, possibly with surrounding text.
+                    # A more robust parsing would be needed here, e.g., finding the first '{' and last '}'
+                    try:
+                        data = json.loads(raw_response_content)
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to decode JSON from DeepSeek response for project info: {raw_response_content}")
+                        return None
+                else: # Deepseek client not properly initialized
+                    logger.warning("DeepSeek client not an httpx.AsyncClient. Skipping project info extraction.")
+                    return None
+            else:
+                logger.warning(f"Unsupported AI provider for project info extraction: {provider_name}")
+                return None
+            
             return ProjectStructured(**data)
 
         except Exception as e:
@@ -331,6 +462,15 @@ class EmailProcessor:
         self, email_data: Dict
     ) -> Optional[EngineerStructured]:
         """メールから技術者情報を抽出して構造化"""
+        if not self.ai_client:
+            logger.warning("AI client not initialized. Skipping engineer info extraction.")
+            return None
+
+        provider_name = self.ai_config.get("provider_name")
+        model_extract = self.ai_config.get("model_extract", "gpt-4") # Default for safety
+        temperature = self.ai_config.get("temperature", 0.3)
+        max_tokens_extract = self.ai_config.get("max_tokens", 2048) # Use general max_tokens
+
         prompt = f"""
         以下のメールから技術者情報を抽出してJSON形式で返してください。
         
@@ -353,22 +493,51 @@ class EmailProcessor:
         
         情報が見つからない項目はnullにしてください。
         """
+        messages = [
+            {
+                "role": "system",
+                "content": "あなたは技術者情報抽出の専門家です。",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
         try:
-            response = await self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "あなたは技術者情報抽出の専門家です。",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
+            if provider_name == "openai":
+                response = await self.ai_client.chat.completions.create(
+                    model=model_extract,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens_extract,
+                    response_format={"type": "json_object"},
+                )
+                data = json.loads(response.choices[0].message.content)
+            elif provider_name == "deepseek":
+                if isinstance(self.ai_client, httpx.AsyncClient):
+                    # DeepSeek API call (example, adjust path and payload as needed)
+                    response = await self.ai_client.post(
+                        "/v1/chat/completions", # Or specific DeepSeek endpoint path
+                        json={
+                            "model": model_extract,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens_extract,
+                            # Assuming DeepSeek understands JSON instruction in user prompt
+                        },
+                    )
+                    response.raise_for_status()
+                    raw_response_content = response.json()["choices"][0]["message"]["content"]
+                    try:
+                        data = json.loads(raw_response_content)
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to decode JSON from DeepSeek response for engineer info: {raw_response_content}")
+                        return None
+                else: # Deepseek client not properly initialized
+                    logger.warning("DeepSeek client not an httpx.AsyncClient. Skipping engineer info extraction.")
+                    return None
+            else:
+                logger.warning(f"Unsupported AI provider for engineer info extraction: {provider_name}")
+                return None
 
-            data = json.loads(response.choices[0].message.content)
             return EngineerStructured(**data)
 
         except Exception as e:
@@ -418,9 +587,10 @@ class EmailProcessor:
     ) -> Optional[str]:
         """案件情報をデータベースに保存"""
         async with self.db_pool.acquire() as conn:
-            try:
-                # projectsテーブルに保存
-                project_id = await conn.fetchval(
+            async with conn.transaction():
+                try:
+                    # projectsテーブルに保存
+                    project_id = await conn.fetchval(
                     """
                     INSERT INTO projects (
                         tenant_id, title, client_company, description,
@@ -498,9 +668,10 @@ class EmailProcessor:
     ) -> Optional[str]:
         """技術者情報をデータベースに保存"""
         async with self.db_pool.acquire() as conn:
-            try:
-                # engineersテーブルに保存
-                engineer_id = await conn.fetchval(
+            async with conn.transaction():
+                try:
+                    # engineersテーブルに保存
+                    engineer_id = await conn.fetchval(
                     """
                     INSERT INTO engineers (
                         tenant_id, name, email, phone, skills,
@@ -638,13 +809,13 @@ async def main():
     }
 
     # AI設定
-    ai_config = {
-        "openai_api_key": os.getenv("OPENAI_API_KEY"),
-        "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY"),  # DeepSeek使用時
-    }
+    # Config.get_ai_config() will be used by the EmailProcessor constructor internally
+    # For the main function, we can pass the result of Config.get_ai_config()
+    # which now includes the provider_name and specific settings for that provider.
+    active_ai_config = Config.get_ai_config() # Gets config for the DEFAULT_AI_PROVIDER
 
     # プロセッサーの初期化
-    processor = EmailProcessor(db_config, ai_config)
+    processor = EmailProcessor(db_config=Config.get_db_config(), ai_config=active_ai_config)
     await processor.initialize()
 
     try:

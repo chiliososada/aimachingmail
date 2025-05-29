@@ -27,20 +27,22 @@ class Config:
         "openai": {
             "api_key": os.getenv("OPENAI_API_KEY"),
             "model_classify": os.getenv("OPENAI_MODEL_CLASSIFY", "gpt-3.5-turbo"),
-            "model_extract": os.getenv("OPENAI_MODEL_EXTRACT", "gpt-4"),
+            "model_extract": os.getenv("OPENAI_MODEL_EXTRACT", "gpt-4"), # Used for both project and engineer
             "temperature": float(os.getenv("OPENAI_TEMPERATURE", 0.3)),
-            "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", 1000)),
+            "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", 2048)), # Increased for potentially larger extractions
         },
         "deepseek": {
             "api_key": os.getenv("DEEPSEEK_API_KEY"),
-            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            "api_base_url": os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+            "model_classify": os.getenv("DEEPSEEK_MODEL_CLASSIFY", "deepseek-chat"), # Assuming same model for now
+            "model_extract": os.getenv("DEEPSEEK_MODEL_EXTRACT", "deepseek-chat"), # Assuming same model for now
             "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", 0.3)),
-            "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", 1000)),
+            "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", 2048)), # Increased for potentially larger extractions
         },
     }
 
     # 使用するAIプロバイダー
-    DEFAULT_AI_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "openai")
+    DEFAULT_AI_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "openai").lower() # Ensure lowercase for consistency
 
     # メール処理設定
     EMAIL_PROCESSING = {
@@ -66,10 +68,18 @@ class Config:
         return cls.DATABASE
 
     @classmethod
-    def get_ai_config(cls, provider: Optional[str] = None) -> Dict[str, Any]:
+    def get_ai_config(cls, provider_name: Optional[str] = None) -> Dict[str, Any]:
         """AI設定を取得"""
-        provider = provider or cls.DEFAULT_AI_PROVIDER
-        return cls.AI_PROVIDERS.get(provider, cls.AI_PROVIDERS["openai"])
+        provider_to_use = (provider_name or cls.DEFAULT_AI_PROVIDER).lower()
+        
+        if provider_to_use not in cls.AI_PROVIDERS:
+            # Fallback to default if the specified provider is not found
+            logger.warning(f"AI provider '{provider_to_use}' not found in config. Falling back to default '{cls.DEFAULT_AI_PROVIDER}'.")
+            provider_to_use = cls.DEFAULT_AI_PROVIDER
+
+        config = cls.AI_PROVIDERS[provider_to_use].copy() # Return a copy to prevent modification of original config
+        config["provider_name"] = provider_to_use # Add provider_name to the returned dict
+        return config
 
     @classmethod
     def validate(cls):
@@ -80,11 +90,20 @@ class Config:
         if not cls.DATABASE["password"]:
             errors.append("Database password is not set")
 
-        if (
-            not cls.AI_PROVIDERS["openai"]["api_key"]
-            and not cls.AI_PROVIDERS["deepseek"]["api_key"]
-        ):
-            errors.append("At least one AI provider API key must be set")
+        # Validate the default provider
+        if cls.DEFAULT_AI_PROVIDER not in cls.AI_PROVIDERS:
+            errors.append(f"Default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not defined in AI_PROVIDERS.")
+        else:
+            # Validate the configuration for the default provider
+            default_provider_config = cls.AI_PROVIDERS[cls.DEFAULT_AI_PROVIDER]
+            if not default_provider_config.get("api_key"):
+                errors.append(f"API key for the default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not set.")
+            if cls.DEFAULT_AI_PROVIDER == "deepseek" and not default_provider_config.get("api_base_url"):
+                errors.append(f"API base URL for DeepSeek is not set.")
+
+        # Check if at least one provider has an API key if you want to allow switching
+        # This is somewhat covered by validating the default provider, but you might add more checks
+        # if you expect users to switch to other providers at runtime without a default.
 
         if not cls.ENCRYPTION_KEY:
             errors.append("Encryption key is not set")

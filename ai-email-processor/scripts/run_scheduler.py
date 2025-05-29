@@ -63,7 +63,13 @@ if __name__ == "__main__":
         # イベントループを作成して実行
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        scheduler.start()
+        loop.run_until_complete(scheduler.start_async())
+    except KeyboardInterrupt:
+        logger.info("Scheduler interrupted by user.")
+        if scheduler:
+            scheduler.stop()
     except Exception as e:
         logger.error(f"Scheduler error: {e}")
         sys.exit(1)
+    finally:
+        logger.info("Scheduler finished.")
