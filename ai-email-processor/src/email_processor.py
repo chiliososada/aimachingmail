@@ -4,7 +4,7 @@ import json
 import imaplib
 import email
 from email.header import decode_header
-from datetime import datetime
+from datetime import datetime, date
 import asyncio
 import logging
 import re
@@ -77,15 +77,27 @@ class ProjectStructured(BaseModel):
 
     title: str
     client_company: Optional[str] = None
+    partner_company: Optional[str] = None
     description: Optional[str] = None
+    detail_description: Optional[str] = None
     skills: List[str] = Field(default_factory=list)
+    key_technologies: Optional[str] = None
     location: Optional[str] = None
+    work_type: Optional[str] = None
     start_date: Optional[str] = None
     duration: Optional[str] = None
+    application_deadline: Optional[str] = None
     budget: Optional[str] = None
+    desired_budget: Optional[str] = None
     japanese_level: Optional[str] = None
-    work_type: Optional[str] = None
     experience: Optional[str] = None
+    foreigner_accepted: Optional[bool] = False
+    freelancer_accepted: Optional[bool] = False
+    interview_count: Optional[str] = "1"
+    processes: List[str] = Field(default_factory=list)
+    max_candidates: Optional[int] = 5
+    manager_name: Optional[str] = None
+    manager_email: Optional[str] = None
 
 
 class EngineerStructured(BaseModel):
@@ -94,13 +106,30 @@ class EngineerStructured(BaseModel):
     name: str
     email: Optional[str] = None
     phone: Optional[str] = None
-    skills: List[str] = Field(default_factory=list)
-    experience: str
-    japanese_level: Optional[str] = None
-    work_experience: Optional[str] = None
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    nationality: Optional[str] = None
+    nearest_station: Optional[str] = None
     education: Optional[str] = None
+    arrival_year_japan: Optional[str] = None
+    certifications: List[str] = Field(default_factory=list)
+    skills: List[str] = Field(default_factory=list)
+    technical_keywords: List[str] = Field(default_factory=list)
+    experience: str
+    work_scope: Optional[str] = None
+    work_experience: Optional[str] = None
+    japanese_level: Optional[str] = None
+    english_level: Optional[str] = None
+    availability: Optional[str] = None
+    preferred_work_style: List[str] = Field(default_factory=list)
+    preferred_locations: List[str] = Field(default_factory=list)
     desired_rate_min: Optional[int] = None
     desired_rate_max: Optional[int] = None
+    overtime_available: Optional[bool] = False
+    business_trip_available: Optional[bool] = False
+    self_promotion: Optional[str] = None
+    remarks: Optional[str] = None
+    recommendation: Optional[str] = None
 
 
 class EmailProcessor:
@@ -309,6 +338,10 @@ class EmailProcessor:
             return None
 
         date_str = date_str.strip()
+
+        # 处理"即日"的情况
+        if date_str in ["即日", "即日開始", "すぐ", "今すぐ", "ASAP"]:
+            return datetime.now().strftime("%Y-%m-%d")
 
         if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
             try:
@@ -757,7 +790,7 @@ JSON形式のみで回答してください。
             return EmailType.UNCLASSIFIED
 
     # ===============================
-    # 其他现有方法保持不变
+    # SMTP设置获取方法
     # ===============================
 
     async def get_smtp_settings(self, tenant_id: str) -> List[SMTPSettings]:
@@ -782,7 +815,7 @@ JSON形式のみで回答してください。
                     if row["smtp_password_encrypted"]:
                         password_data = row["smtp_password_encrypted"]
 
-                        # 处理PostgreSQL BYTEA字段类型转换
+                        # 处理text类型字段
                         if isinstance(password_data, str):
                             hex_str = password_data
                             if hex_str.startswith("\\x"):
@@ -931,8 +964,9 @@ JSON形式のみで回答してください。
             "received_at": datetime.now(),
         }
 
-    # 其他方法（extract_project_info, extract_engineer_info, save_email_to_db 等）保持不变
-    # 为了简洁起见，这里不重复贴出所有方法，但实际使用时需要保留所有现有方法
+    # ===============================
+    # AI数据提取方法
+    # ===============================
 
     async def extract_project_info(
         self, email_data: Dict
@@ -962,24 +996,38 @@ JSON形式のみで回答してください。
         {{
             "title": "案件タイトル",
             "client_company": "クライアント企業名",
+            "partner_company": "パートナー企業名",
             "description": "案件概要",
+            "detail_description": "詳細説明",
             "skills": ["必要スキル1", "必要スキル2"],
+            "key_technologies": "主要技術",
             "location": "勤務地",
+            "work_type": "勤務形態（常駐/リモート/ハイブリッド等）",
             "start_date": "開始日（YYYY-MM-DD形式、例：2024-06-01）",
             "duration": "期間",
+            "application_deadline": "応募締切（YYYY-MM-DD形式）",
             "budget": "予算/単価",
+            "desired_budget": "希望予算",
             "japanese_level": "日本語レベル",
-            "work_type": "勤務形態",
-            "experience": "必要経験"
+            "experience": "必要経験",
+            "foreigner_accepted": "外国人受入可能（true/false）",
+            "freelancer_accepted": "フリーランス受入可能（true/false）",
+            "interview_count": "面接回数",
+            "processes": ["工程1", "工程2"],
+            "max_candidates": "最大候補者数",
+            "manager_name": "担当者名",
+            "manager_email": "担当者メール"
         }}
         
         重要：
         - start_dateは必ずYYYY-MM-DD形式で返してください（例：2024-06-01）
         - 「2024年6月」のような表記は「2024-06-01」に変換してください
         - 具体的な日が不明な場合は月初（01日）にしてください
+        - 開始日が即日・すぐ等の場合は現在の日付を使用してください
         - 情報が見つからない項目はnullにしてください
         - JSONのみを返してください
         """
+
         messages = [
             {
                 "role": "system",
@@ -1025,54 +1073,21 @@ JSON形式のみで回答してください。
                         )
 
                         response_json = response.json()
-                        logger.info("=== DeepSeek API Response ===")
-                        logger.info(
-                            f"Full response: {json.dumps(response_json, indent=2, ensure_ascii=False)}"
-                        )
-
                         raw_response_content = response_json["choices"][0]["message"][
                             "content"
                         ]
+
                         logger.info("=== DeepSeek Raw Content ===")
                         logger.info(f"Raw content:\n{raw_response_content}")
-                        logger.info("=== End Raw Content ===")
-
-                        print("\n" + "=" * 50)
-                        print("DeepSeek API 返回内容:")
-                        print("=" * 50)
-                        print(raw_response_content)
-                        print("=" * 50 + "\n")
 
                         data = self._extract_json_from_text(raw_response_content)
                         if data:
                             logger.info(
                                 f"Successfully extracted JSON: {json.dumps(data, indent=2, ensure_ascii=False)}"
                             )
-                            print(
-                                f"✅ JSON解析成功: {json.dumps(data, indent=2, ensure_ascii=False)}"
-                            )
-                        else:
-                            logger.error(
-                                "Failed to extract JSON from DeepSeek response"
-                            )
-                            print("❌ JSON解析失败")
 
-                    except httpx.ReadTimeout as e:
-                        logger.error(f"DeepSeek API timeout error: {e}")
-                        print(f"❌ DeepSeek API 超时错误: {e}")
-                        return None
-                    except httpx.HTTPStatusError as e:
-                        logger.error(f"DeepSeek API HTTP error: {e}")
-                        logger.error(f"Response text: {e.response.text}")
-                        print(f"❌ DeepSeek API HTTP错误: {e}")
-                        print(f"响应内容: {e.response.text}")
-                        return None
-                    except KeyError as e:
-                        logger.error(f"DeepSeek API response format error: {e}")
-                        logger.error(
-                            f"Response: {response.json() if 'response' in locals() else 'No response'}"
-                        )
-                        print(f"❌ DeepSeek API 响应格式错误: {e}")
+                    except Exception as e:
+                        logger.error(f"DeepSeek API error: {e}")
                         return None
                 else:
                     logger.warning(
@@ -1086,10 +1101,22 @@ JSON形式のみで回答してください。
                 return None
 
             if data:
-                # 处理日期格式
-                if data.get("start_date"):
+                # 处理日期格式，如果没有开始日期，默认为当前日期
+                if not data.get("start_date"):
+                    data["start_date"] = datetime.now().strftime("%Y-%m-%d")
+                    logger.info("项目开始日期未指定，设置为当前日期（即日）")
+                else:
                     normalized_date = self._parse_date_string(data["start_date"])
-                    data["start_date"] = normalized_date
+                    data["start_date"] = normalized_date or datetime.now().strftime(
+                        "%Y-%m-%d"
+                    )
+
+                # 处理应募截止日期
+                if data.get("application_deadline"):
+                    normalized_deadline = self._parse_date_string(
+                        data["application_deadline"]
+                    )
+                    data["application_deadline"] = normalized_deadline
 
                 return ProjectStructured(**data)
             else:
@@ -1132,18 +1159,38 @@ JSON形式のみで回答してください。
             "name": "技術者名",
             "email": "メールアドレス",
             "phone": "電話番号",
-            "skills": ["スキル1", "スキル2"],
-            "experience": "経験年数",
-            "japanese_level": "日本語レベル",
-            "work_experience": "職務経歴",
+            "gender": "性別（男性/女性/回答しない）",
+            "age": "年齢",
+            "nationality": "国籍",
+            "nearest_station": "最寄り駅",
             "education": "学歴",
-            "desired_rate_min": 希望単価下限,
-            "desired_rate_max": 希望単価上限
+            "arrival_year_japan": "来日年度",
+            "certifications": ["資格1", "資格2"],
+            "skills": ["スキル1", "スキル2"],
+            "technical_keywords": ["技術キーワード1", "技術キーワード2"],
+            "experience": "経験年数",
+            "work_scope": "作業範囲",
+            "work_experience": "職務経歴",
+            "japanese_level": "日本語レベル（不問/日常会話レベル/ビジネスレベル/ネイティブレベル）",
+            "english_level": "英語レベル（不問/日常会話レベル/ビジネスレベル/ネイティブレベル）",
+            "availability": "稼働可能時期",
+            "preferred_work_style": ["希望勤務形態1", "希望勤務形態2"],
+            "preferred_locations": ["希望勤務地1", "希望勤務地2"],
+            "desired_rate_min": "希望単価下限（数値のみ）",
+            "desired_rate_max": "希望単価上限（数値のみ）",
+            "overtime_available": "残業対応可能（true/false）",
+            "business_trip_available": "出張対応可能（true/false）",
+            "self_promotion": "自己PR",
+            "remarks": "備考",
+            "recommendation": "推薦コメント"
         }}
         
-        情報が見つからない項目はnullにしてください。
-        JSONのみを返してください。
+        重要：
+        - 情報が見つからない項目はnullにしてください
+        - desired_rate_min/maxは数値のみを返してください（万円表記は除く）
+        - JSONのみを返してください
         """
+
         messages = [
             {
                 "role": "system",
@@ -1169,9 +1216,6 @@ JSON形式のみで回答してください。
                         logger.info(
                             "Sending request to DeepSeek API for engineer extraction..."
                         )
-                        logger.debug(
-                            f"Request payload: model={model_extract}, temperature={temperature}, max_tokens={max_tokens_extract}"
-                        )
 
                         response = await self.ai_client.post(
                             "/v1/chat/completions",
@@ -1184,59 +1228,22 @@ JSON形式のみで回答してください。
                         )
                         response.raise_for_status()
 
-                        logger.info(
-                            f"DeepSeek API responded with status: {response.status_code}"
-                        )
-
                         response_json = response.json()
-                        logger.info("=== DeepSeek API Response (Engineer) ===")
-                        logger.info(
-                            f"Full response: {json.dumps(response_json, indent=2, ensure_ascii=False)}"
-                        )
-
                         raw_response_content = response_json["choices"][0]["message"][
                             "content"
                         ]
+
                         logger.info("=== DeepSeek Raw Content (Engineer) ===")
                         logger.info(f"Raw content:\n{raw_response_content}")
-                        logger.info("=== End Raw Content ===")
-
-                        print("\n" + "=" * 50)
-                        print("DeepSeek API 返回内容 (工程师信息):")
-                        print("=" * 50)
-                        print(raw_response_content)
-                        print("=" * 50 + "\n")
 
                         data = self._extract_json_from_text(raw_response_content)
                         if data:
                             logger.info(
                                 f"Successfully extracted JSON: {json.dumps(data, indent=2, ensure_ascii=False)}"
                             )
-                            print(
-                                f"✅ JSON解析成功: {json.dumps(data, indent=2, ensure_ascii=False)}"
-                            )
-                        else:
-                            logger.error(
-                                "Failed to extract JSON from DeepSeek response"
-                            )
-                            print("❌ JSON解析失败")
 
-                    except httpx.ReadTimeout as e:
-                        logger.error(f"DeepSeek API timeout error: {e}")
-                        print(f"❌ DeepSeek API 超时错误: {e}")
-                        return None
-                    except httpx.HTTPStatusError as e:
-                        logger.error(f"DeepSeek API HTTP error: {e}")
-                        logger.error(f"Response text: {e.response.text}")
-                        print(f"❌ DeepSeek API HTTP错误: {e}")
-                        print(f"响应内容: {e.response.text}")
-                        return None
-                    except KeyError as e:
-                        logger.error(f"DeepSeek API response format error: {e}")
-                        logger.error(
-                            f"Response: {response.json() if 'response' in locals() else 'No response'}"
-                        )
-                        print(f"❌ DeepSeek API 响应格式错误: {e}")
+                    except Exception as e:
+                        logger.error(f"DeepSeek API error: {e}")
                         return None
                 else:
                     logger.warning(
@@ -1262,6 +1269,10 @@ JSON形式のみで回答してください。
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
 
+    # ===============================
+    # 数据库保存方法
+    # ===============================
+
     async def save_email_to_db(
         self,
         tenant_id: str,
@@ -1277,8 +1288,8 @@ JSON形式のみで回答してください。
                     tenant_id, subject, body_text, body_html,
                     sender_name, sender_email, email_type,
                     processing_status, ai_extracted_data,
-                    received_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    received_at, attachments
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING id
             """,
                 tenant_id,
@@ -1291,6 +1302,7 @@ JSON形式のみで回答してください。
                 ProcessingStatus.PROCESSING.value,
                 json.dumps(extracted_data) if extracted_data else "{}",
                 email_data["received_at"],
+                json.dumps(email_data.get("attachments", [])),
             )
 
             return str(email_id)
@@ -1306,59 +1318,80 @@ JSON形式のみで回答してください。
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
                 try:
+                    # 处理开始日期
                     start_date_value = None
                     if project_data.start_date:
-                        normalized_date = self._parse_date_string(
-                            project_data.start_date
-                        )
-                        if normalized_date:
-                            try:
-                                start_date_value = datetime.strptime(
-                                    normalized_date, "%Y-%m-%d"
-                                ).date()
-                                logger.info(
-                                    f"Converted start_date to database format: {start_date_value}"
-                                )
-                            except ValueError as e:
-                                logger.warning(
-                                    f"Failed to convert normalized date {normalized_date} to date object: {e}"
-                                )
-                                start_date_value = None
-                        else:
-                            logger.warning(
-                                f"Failed to normalize date: {project_data.start_date}"
+                        try:
+                            start_date_value = datetime.strptime(
+                                project_data.start_date, "%Y-%m-%d"
+                            ).date()
+                            logger.info(
+                                f"Converted start_date to database format: {start_date_value}"
                             )
-                            start_date_value = None
+                        except ValueError as e:
+                            logger.warning(
+                                f"Failed to convert start_date {project_data.start_date} to date object: {e}"
+                            )
+                            start_date_value = date.today()  # 默认为今天
+                    else:
+                        start_date_value = date.today()  # 默认为今天
+
+                    # 处理应募截止日期
+                    application_deadline_value = None
+                    if project_data.application_deadline:
+                        try:
+                            application_deadline_value = datetime.strptime(
+                                project_data.application_deadline, "%Y-%m-%d"
+                            ).date()
+                        except ValueError as e:
+                            logger.warning(
+                                f"Failed to convert application_deadline {project_data.application_deadline} to date object: {e}"
+                            )
 
                     project_id = await conn.fetchval(
                         """
                         INSERT INTO projects (
-                            tenant_id, title, client_company, description,
-                            skills, location, start_date, duration,
-                            budget, japanese_level, work_type, experience,
-                            source, ai_processed, status, partner_company,
-                            manager_email, created_at
+                            tenant_id, title, client_company, partner_company,
+                            description, detail_description, skills, key_technologies,
+                            location, work_type, start_date, duration,
+                            application_deadline, budget, desired_budget,
+                            japanese_level, experience, foreigner_accepted,
+                            freelancer_accepted, interview_count, processes,
+                            max_candidates, manager_name, manager_email,
+                            company_type, source, ai_processed, status, 
+                            created_at, registered_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, 
-                            $7, $8, $9, $10, $11, $12,
-                            'mail_import', true, '募集中', '他社',
-                            $13, $14
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                            $23, $24, '他社', 'mail_import', true, '募集中',
+                            $25, $25
                         )
                         RETURNING id
                     """,
                         tenant_id,
                         project_data.title,
                         project_data.client_company,
+                        project_data.partner_company,
                         project_data.description,
-                        project_data.skills,
+                        project_data.detail_description,
+                        project_data.skills or [],
+                        project_data.key_technologies,
                         project_data.location,
+                        project_data.work_type,
                         start_date_value,
                         project_data.duration,
+                        application_deadline_value,
                         project_data.budget,
+                        project_data.desired_budget,
                         project_data.japanese_level,
-                        project_data.work_type,
                         project_data.experience,
-                        sender_email,
+                        project_data.foreigner_accepted or False,
+                        project_data.freelancer_accepted or False,
+                        project_data.interview_count or "1",
+                        project_data.processes or [],
+                        project_data.max_candidates or 5,
+                        project_data.manager_name,
+                        project_data.manager_email or sender_email,
                         datetime.now(),
                     )
 
@@ -1408,14 +1441,21 @@ JSON形式のみで回答してください。
                     engineer_id = await conn.fetchval(
                         """
                         INSERT INTO engineers (
-                            tenant_id, name, email, phone, skills,
-                            experience, japanese_level, work_experience,
-                            education, desired_rate_min, desired_rate_max,
-                            company_type, source, current_status,
+                            tenant_id, name, email, phone, gender, age,
+                            nationality, nearest_station, education,
+                            arrival_year_japan, certifications, skills,
+                            technical_keywords, experience, work_scope,
+                            work_experience, japanese_level, english_level,
+                            availability, preferred_work_style, preferred_locations,
+                            desired_rate_min, desired_rate_max, overtime_available,
+                            business_trip_available, self_promotion, remarks,
+                            recommendation, company_type, source, current_status,
                             created_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                            '他社', 'mail', '提案中', $12
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                            $23, $24, $25, $26, $27, $28, '他社', 'mail', '提案中',
+                            $29
                         )
                         RETURNING id
                     """,
@@ -1423,13 +1463,30 @@ JSON形式のみで回答してください。
                         engineer_data.name,
                         engineer_data.email or sender_email,
                         engineer_data.phone,
-                        engineer_data.skills,
-                        engineer_data.experience,
-                        engineer_data.japanese_level,
-                        engineer_data.work_experience,
+                        engineer_data.gender,
+                        engineer_data.age,
+                        engineer_data.nationality,
+                        engineer_data.nearest_station,
                         engineer_data.education,
+                        engineer_data.arrival_year_japan,
+                        engineer_data.certifications or [],
+                        engineer_data.skills or [],
+                        engineer_data.technical_keywords or [],
+                        engineer_data.experience,
+                        engineer_data.work_scope,
+                        engineer_data.work_experience,
+                        engineer_data.japanese_level,
+                        engineer_data.english_level,
+                        engineer_data.availability,
+                        engineer_data.preferred_work_style or [],
+                        engineer_data.preferred_locations or [],
                         engineer_data.desired_rate_min,
                         engineer_data.desired_rate_max,
+                        engineer_data.overtime_available or False,
+                        engineer_data.business_trip_available or False,
+                        engineer_data.self_promotion,
+                        engineer_data.remarks,
+                        engineer_data.recommendation,
                         datetime.now(),
                     )
 
