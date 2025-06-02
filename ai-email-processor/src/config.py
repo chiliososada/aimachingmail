@@ -30,40 +30,30 @@ class Config:
         "openai": {
             "api_key": os.getenv("OPENAI_API_KEY"),
             "model_classify": os.getenv("OPENAI_MODEL_CLASSIFY", "gpt-3.5-turbo"),
-            "model_extract": os.getenv(
-                "OPENAI_MODEL_EXTRACT", "gpt-4"
-            ),  # Used for both project and engineer
-            "temperature": float(os.getenv("OPENAI_TEMPERATURE", 0.3)),
-            "max_tokens": int(
-                os.getenv("OPENAI_MAX_TOKENS", 2048)
-            ),  # Increased for potentially larger extractions
-            "timeout": float(os.getenv("OPENAI_TIMEOUT", 60.0)),  # 超时设置
+            "model_extract": os.getenv("OPENAI_MODEL_EXTRACT", "gpt-4"),
+            "temperature": float(
+                os.getenv("OPENAI_TEMPERATURE", 0.1)
+            ),  # 降低温度提高一致性
+            "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", 300)),  # 增加token数量
+            "timeout": float(os.getenv("OPENAI_TIMEOUT", 60.0)),
         },
         "deepseek": {
             "api_key": os.getenv("DEEPSEEK_API_KEY"),
             "api_base_url": os.getenv(
                 "DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"
             ),
-            "model_classify": os.getenv(
-                "DEEPSEEK_MODEL_CLASSIFY", "deepseek-chat"
-            ),  # Assuming same model for now
-            "model_extract": os.getenv(
-                "DEEPSEEK_MODEL_EXTRACT", "deepseek-chat"
-            ),  # Assuming same model for now
-            "temperature": float(os.getenv("DEEPSEEK_TEMPERATURE", 0.3)),
-            "max_tokens": int(
-                os.getenv("DEEPSEEK_MAX_TOKENS", 2048)
-            ),  # Increased for potentially larger extractions
-            "timeout": float(
-                os.getenv("DEEPSEEK_TIMEOUT", 120.0)
-            ),  # DeepSeek可能需要更长的超时时间
+            "model_classify": os.getenv("DEEPSEEK_MODEL_CLASSIFY", "deepseek-chat"),
+            "model_extract": os.getenv("DEEPSEEK_MODEL_EXTRACT", "deepseek-chat"),
+            "temperature": float(
+                os.getenv("DEEPSEEK_TEMPERATURE", 0.1)
+            ),  # 降低温度提高一致性
+            "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", 300)),  # 增加token数量
+            "timeout": float(os.getenv("DEEPSEEK_TIMEOUT", 120.0)),
         },
     }
 
     # 使用するAIプロバイダー
-    DEFAULT_AI_PROVIDER = os.getenv(
-        "DEFAULT_AI_PROVIDER", "openai"
-    ).lower()  # Ensure lowercase for consistency
+    DEFAULT_AI_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", "deepseek").lower()
 
     # メール処理設定
     EMAIL_PROCESSING = {
@@ -71,6 +61,43 @@ class Config:
         "interval_minutes": int(os.getenv("EMAIL_CHECK_INTERVAL", 10)),
         "retry_attempts": int(os.getenv("EMAIL_RETRY_ATTEMPTS", 3)),
         "retry_delay": int(os.getenv("EMAIL_RETRY_DELAY", 60)),
+    }
+
+    # 改进邮件分类器配置
+    CLASSIFICATION = {
+        # 分类置信度阈值
+        "confidence_threshold": float(
+            os.getenv("CLASSIFICATION_CONFIDENCE_THRESHOLD", 0.7)
+        ),
+        # 是否启用详细分类日志
+        "enable_detailed_logging": os.getenv(
+            "ENABLE_CLASSIFICATION_LOGGING", "true"
+        ).lower()
+        == "true",
+        # 是否启用关键词分析
+        "keyword_analysis_enabled": os.getenv(
+            "KEYWORD_ANALYSIS_ENABLED", "true"
+        ).lower()
+        == "true",
+        # 分类器超时时间（秒）
+        "classification_timeout": int(os.getenv("CLASSIFICATION_TIMEOUT", 30)),
+        # 垃圾邮件检测阈值
+        "spam_keywords_threshold": int(os.getenv("SPAM_KEYWORDS_THRESHOLD", 2)),
+        # 关键词分析权重
+        "keyword_weights": {
+            "high": float(os.getenv("KEYWORD_WEIGHT_HIGH", 3.0)),
+            "medium": float(os.getenv("KEYWORD_WEIGHT_MEDIUM", 1.5)),
+            "low": float(os.getenv("KEYWORD_WEIGHT_LOW", 0.5)),
+        },
+        # 内容提取配置
+        "content_extraction": {
+            "max_length": int(os.getenv("CONTENT_MAX_LENGTH", 2000)),
+            "head_length": int(os.getenv("CONTENT_HEAD_LENGTH", 800)),
+            "tail_length": int(os.getenv("CONTENT_TAIL_LENGTH", 300)),
+            "important_keywords_threshold": int(
+                os.getenv("IMPORTANT_KEYWORDS_THRESHOLD", 2)
+            ),
+        },
     }
 
     # ロギング設定
@@ -94,19 +121,24 @@ class Config:
         provider_to_use = (provider_name or cls.DEFAULT_AI_PROVIDER).lower()
 
         if provider_to_use not in cls.AI_PROVIDERS:
-            # Fallback to default if the specified provider is not found
             logger.warning(
                 f"AI provider '{provider_to_use}' not found in config. Falling back to default '{cls.DEFAULT_AI_PROVIDER}'."
             )
             provider_to_use = cls.DEFAULT_AI_PROVIDER
 
-        config = cls.AI_PROVIDERS[
-            provider_to_use
-        ].copy()  # Return a copy to prevent modification of original config
-        config["provider_name"] = (
-            provider_to_use  # Add provider_name to the returned dict
-        )
+        config = cls.AI_PROVIDERS[provider_to_use].copy()
+        config["provider_name"] = provider_to_use
         return config
+
+    @classmethod
+    def get_classification_config(cls) -> Dict[str, Any]:
+        """分类器配置を取得"""
+        return cls.CLASSIFICATION
+
+    @classmethod
+    def get_email_processing_config(cls) -> Dict[str, Any]:
+        """メール処理設定を取得"""
+        return cls.EMAIL_PROCESSING
 
     @classmethod
     def validate(cls):
@@ -117,13 +149,12 @@ class Config:
         if not cls.DATABASE["password"]:
             errors.append("Database password is not set")
 
-        # Validate the default provider
+        # AI プロバイダーの検証
         if cls.DEFAULT_AI_PROVIDER not in cls.AI_PROVIDERS:
             errors.append(
                 f"Default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not defined in AI_PROVIDERS."
             )
         else:
-            # Validate the configuration for the default provider
             default_provider_config = cls.AI_PROVIDERS[cls.DEFAULT_AI_PROVIDER]
             if not default_provider_config.get("api_key"):
                 errors.append(
@@ -135,12 +166,99 @@ class Config:
             ):
                 errors.append(f"API base URL for DeepSeek is not set.")
 
-        # Check if at least one provider has an API key if you want to allow switching
-        # This is somewhat covered by validating the default provider, but you might add more checks
-        # if you expect users to switch to other providers at runtime without a default.
-
+        # 暗号化キーの確認
         if not cls.ENCRYPTION_KEY:
             errors.append("Encryption key is not set")
 
+        # 分类器配置验证
+        classification_config = cls.CLASSIFICATION
+
+        # 验证置信度阈值
+        confidence_threshold = classification_config["confidence_threshold"]
+        if not 0.0 <= confidence_threshold <= 1.0:
+            errors.append(
+                f"Classification confidence threshold must be between 0.0 and 1.0, got {confidence_threshold}"
+            )
+
+        # 验证超时时间
+        classification_timeout = classification_config["classification_timeout"]
+        if classification_timeout < 5:
+            errors.append(
+                f"Classification timeout must be at least 5 seconds, got {classification_timeout}"
+            )
+
+        # 验证垃圾邮件检测阈值
+        spam_threshold = classification_config["spam_keywords_threshold"]
+        if spam_threshold < 1:
+            errors.append(
+                f"Spam keywords threshold must be at least 1, got {spam_threshold}"
+            )
+
+        # 验证关键词权重
+        keyword_weights = classification_config["keyword_weights"]
+        if not all(w > 0 for w in keyword_weights.values()):
+            errors.append("All keyword weights must be positive")
+
+        # 验证内容提取配置
+        content_config = classification_config["content_extraction"]
+        if content_config["max_length"] < 500:
+            errors.append("Content max length should be at least 500 characters")
+
+        if content_config["head_length"] >= content_config["max_length"]:
+            errors.append("Head length should be less than max length")
+
         if errors:
             raise ValueError(f"Configuration errors: {', '.join(errors)}")
+
+    @classmethod
+    def print_classification_info(cls):
+        """打印分类器配置信息（用于调试）"""
+        print("=== 邮件分类器配置信息 ===")
+        print(f"AI Provider: {cls.DEFAULT_AI_PROVIDER}")
+
+        ai_config = cls.get_ai_config()
+        print(f"AI Model (Classify): {ai_config.get('model_classify')}")
+        print(f"AI Model (Extract): {ai_config.get('model_extract')}")
+        print(f"AI Temperature: {ai_config.get('temperature')}")
+        print(f"AI Max Tokens: {ai_config.get('max_tokens')}")
+        print(f"AI Timeout: {ai_config.get('timeout')}s")
+
+        classification_config = cls.get_classification_config()
+        print(f"\n分类器设置:")
+        print(f"置信度阈值: {classification_config['confidence_threshold']}")
+        print(f"详细日志: {classification_config['enable_detailed_logging']}")
+        print(f"关键词分析: {classification_config['keyword_analysis_enabled']}")
+        print(f"分类超时: {classification_config['classification_timeout']}s")
+        print(f"垃圾邮件阈值: {classification_config['spam_keywords_threshold']}")
+
+        print(f"\n关键词权重:")
+        for level, weight in classification_config["keyword_weights"].items():
+            print(f"  {level}: {weight}")
+
+        print(f"\n内容提取配置:")
+        for key, value in classification_config["content_extraction"].items():
+            print(f"  {key}: {value}")
+
+
+# 配置验证函数
+def validate_configuration():
+    """验证所有配置"""
+    try:
+        Config.validate()
+        print("✅ 配置验证通过")
+        return True
+    except ValueError as e:
+        print(f"❌ 配置验证失败: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    # 当直接运行config.py时，验证配置并打印信息
+    print("🔧 配置验证和信息显示")
+    print("=" * 50)
+
+    if validate_configuration():
+        print("\n" + "=" * 50)
+        Config.print_classification_info()
+    else:
+        print("\n请检查并修正配置错误")

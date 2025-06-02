@@ -7,10 +7,10 @@ from email.header import decode_header
 from datetime import datetime
 import asyncio
 import logging
+import re
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
-import re
 
 import asyncpg
 from openai import AsyncOpenAI
@@ -61,6 +61,17 @@ class SMTPSettings:
     imap_port: Optional[int] = 993
 
 
+@dataclass
+class ClassificationResult:
+    """分类结果包含置信度和详细信息"""
+
+    email_type: EmailType
+    confidence: float
+    reasoning: str
+    keywords_found: List[str]
+    method: str = "improved"
+
+
 class ProjectStructured(BaseModel):
     """構造化された案件データ"""
 
@@ -95,11 +106,9 @@ class EngineerStructured(BaseModel):
 class EmailProcessor:
     def __init__(self, db_config: Dict, ai_config: Dict):
         self.db_config = db_config
-        self.ai_config = ai_config  # This now includes 'provider_name'
+        self.ai_config = ai_config
         self.db_pool: Optional[asyncpg.Pool] = None
-        self.ai_client: Optional[AsyncOpenAI | httpx.AsyncClient] = (
-            None  # Generic AI client
-        )
+        self.ai_client: Optional[AsyncOpenAI | httpx.AsyncClient] = None
 
         provider_name = self.ai_config.get("provider_name")
         api_key = self.ai_config.get("api_key")
@@ -112,11 +121,8 @@ class EmailProcessor:
                     "OpenAI API key not found in config. OpenAI client not initialized."
                 )
         elif provider_name == "deepseek":
-            # Placeholder for DeepSeek Client
-            # For now, we'll use httpx.AsyncClient if an API key and base URL are provided.
-            # This is a simplified direct HTTP client. A dedicated library would be better.
             api_base_url = self.ai_config.get("api_base_url")
-            timeout = self.ai_config.get("timeout", 120.0)  # 从配置获取超时时间
+            timeout = self.ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
                 self.ai_client = httpx.AsyncClient(
                     base_url=api_base_url,
@@ -124,23 +130,116 @@ class EmailProcessor:
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                     },
-                    timeout=timeout,  # 使用配置的超时时间
+                    timeout=timeout,
                 )
                 logger.info(
                     f"DeepSeek client initialized with base URL: {api_base_url}, timeout: {timeout}s"
                 )
             else:
                 logger.warning(
-                    "DeepSeek API key or base URL not found. DeepSeek client not initialized. "
-                    "AI features will not work if DeepSeek is selected and not configured."
+                    "DeepSeek API key or base URL not found. DeepSeek client not initialized."
                 )
-                # self.ai_client will remain None
         else:
             logger.error(
                 f"Unsupported AI provider: {provider_name}. No AI client initialized."
             )
 
-        # The old self.openai_client is removed by not being assigned here.
+        # 初始化改进的分类器组件
+        self._init_classification_components()
+
+    def _init_classification_components(self):
+        """初始化分类器相关组件"""
+        # 关键词词典
+        self.keywords = {
+            "project_related": {
+                "高权重": [
+                    "案件",
+                    "プロジェクト",
+                    "開発案件",
+                    "求人",
+                    "募集",
+                    "参画",
+                    "Java開発",
+                    "Python開発",
+                    "システム開発",
+                    "WEB開発",
+                    "単価",
+                    "稼働",
+                    "常駐",
+                    "リモート",
+                    "フリーランス",
+                    "必須スキル",
+                    "歓迎スキル",
+                    "経験年数",
+                    "即日開始",
+                ],
+                "中权重": [
+                    "技術",
+                    "スキル",
+                    "経験",
+                    "開発",
+                    "設計",
+                    "構築",
+                    "保守",
+                    "運用",
+                    "テスト",
+                    "データベース",
+                    "API",
+                    "クラウド",
+                    "インフラ",
+                    "セキュリティ",
+                ],
+            },
+            "engineer_related": {
+                "高权重": [
+                    "エンジニア",
+                    "技術者",
+                    "開発者",
+                    "プログラマー",
+                    "履歴書",
+                    "職務経歴書",
+                    "スキルシート",
+                    "経歴書",
+                    "自己紹介",
+                    "プロフィール",
+                    "ポートフォリオ",
+                    "希望単価",
+                    "稼働可能",
+                    "参画希望",
+                ],
+                "中权重": [
+                    "経験年数",
+                    "開発経験",
+                    "プロジェクト経験",
+                    "業務経歴",
+                    "得意分野",
+                    "専門分野",
+                    "資格",
+                    "認定",
+                    "学歴",
+                ],
+            },
+        }
+
+        # 排除关键词
+        self.exclusion_keywords = [
+            "広告",
+            "宣伝",
+            "PR",
+            "セール",
+            "キャンペーン",
+            "限定オファー",
+            "今すぐクリック",
+            "特別価格",
+            "無料",
+            "プレゼント",
+        ]
+
+        # 发件人域名模式
+        self.sender_patterns = {
+            "recruiting": ["recruit", "hr", "jinzai", "career", "agent"],
+            "suspicious": ["noreply", "spam", "promo", "marketing", "no-reply"],
+        }
 
     async def initialize(self):
         """初期化処理"""
@@ -157,13 +256,11 @@ class EmailProcessor:
         logger.debug(f"Attempting to extract JSON from text: {text[:500]}...")
 
         try:
-            # まず全体をJSONとして解析を試行
             result = json.loads(text.strip())
             logger.debug("Direct JSON parsing successful")
             return result
         except json.JSONDecodeError as e:
             logger.debug(f"Direct JSON parsing failed: {e}")
-            # 失敗した場合、JSON部分を探して抽出
             json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
             matches = re.findall(json_pattern, text, re.DOTALL)
 
@@ -179,7 +276,6 @@ class EmailProcessor:
                     logger.debug(f"Match {i+1} failed to parse")
                     continue
 
-            # より複雑なネストしたJSONを処理
             start_idx = text.find("{")
             if start_idx != -1:
                 logger.debug(
@@ -214,29 +310,23 @@ class EmailProcessor:
 
         date_str = date_str.strip()
 
-        # 如果已经是标准格式，直接返回
         if re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
             try:
-                # 验证日期是否有效
                 datetime.strptime(date_str, "%Y-%m-%d")
                 return date_str
             except ValueError:
                 logger.warning(f"Invalid standard date format: {date_str}")
                 return None
 
-        # 处理中文日期格式
         try:
-            # 匹配 "2024年6月" 格式
             match = re.match(r"(\d{4})年(\d{1,2})月?(?:(\d{1,2})日?)?", date_str)
             if match:
                 year = int(match.group(1))
                 month = int(match.group(2))
-                day = int(match.group(3)) if match.group(3) else 1  # 默认为月初
+                day = int(match.group(3)) if match.group(3) else 1
 
-                # 验证日期范围
                 if 1 <= month <= 12 and 1 <= day <= 31:
                     formatted_date = f"{year:04d}-{month:02d}-{day:02d}"
-                    # 验证日期是否有效
                     try:
                         datetime.strptime(formatted_date, "%Y-%m-%d")
                         logger.info(
@@ -247,7 +337,6 @@ class EmailProcessor:
                         logger.warning(f"Invalid converted date: {formatted_date}")
                         return None
 
-            # 匹配其他可能的格式 "2024/06", "2024-06" 等
             match = re.match(r"(\d{4})[/-](\d{1,2})(?:[/-](\d{1,2}))?", date_str)
             if match:
                 year = int(match.group(1))
@@ -266,13 +355,410 @@ class EmailProcessor:
                         logger.warning(f"Invalid converted date: {formatted_date}")
                         return None
 
-            # 如果无法识别格式，记录警告并返回None
             logger.warning(f"Unable to parse date format: {date_str}")
             return None
 
         except Exception as e:
             logger.error(f"Error parsing date '{date_str}': {e}")
             return None
+
+    # ===============================
+    # 改进的邮件分类相关方法
+    # ===============================
+
+    def analyze_sender_info(self, email_data: Dict) -> Dict:
+        """分析发件人信息"""
+        sender_email = email_data.get("sender_email", "").lower()
+        sender_name = email_data.get("sender_name", "").lower()
+
+        analysis = {"domain_type": "unknown", "confidence": 0.0, "indicators": []}
+
+        if "@" in sender_email:
+            domain = sender_email.split("@")[1]
+
+            # 检查招聘相关域名
+            for pattern in self.sender_patterns["recruiting"]:
+                if pattern in domain or pattern in sender_name:
+                    analysis["domain_type"] = "recruiting"
+                    analysis["confidence"] = 0.7
+                    analysis["indicators"].append(f"recruiting_domain:{pattern}")
+                    break
+
+            # 检查可疑域名
+            for pattern in self.sender_patterns["suspicious"]:
+                if pattern in domain:
+                    analysis["domain_type"] = "suspicious"
+                    analysis["confidence"] = 0.8
+                    analysis["indicators"].append(f"suspicious_domain:{pattern}")
+                    break
+
+        return analysis
+
+    def analyze_attachments(self, email_data: Dict) -> Dict:
+        """分析附件信息"""
+        attachments = email_data.get("attachments", [])
+
+        analysis = {
+            "total_count": len(attachments),
+            "engineer_indicators": [],
+            "project_indicators": [],
+            "confidence": 0.0,
+            "strong_type": None,
+        }
+
+        if not attachments:
+            return analysis
+
+        engineer_patterns = [
+            r"履歴書",
+            r"職務経歴",
+            r"スキルシート",
+            r"resume",
+            r"cv",
+            r"profile",
+        ]
+        project_patterns = [r"案件", r"project", r"proposal", r"詳細", r"仕様", r"要件"]
+
+        for attachment in attachments:
+            filename = attachment.get("filename", "").lower()
+
+            # 检查工程师相关附件
+            for pattern in engineer_patterns:
+                if re.search(pattern, filename):
+                    analysis["engineer_indicators"].append(filename)
+                    analysis["confidence"] = 0.9
+                    analysis["strong_type"] = "engineer_related"
+
+            # 检查项目相关附件
+            for pattern in project_patterns:
+                if re.search(pattern, filename):
+                    analysis["project_indicators"].append(filename)
+                    if analysis["confidence"] < 0.8:
+                        analysis["confidence"] = 0.8
+                        analysis["strong_type"] = "project_related"
+
+        return analysis
+
+    def smart_content_extraction(self, email_data: Dict) -> str:
+        """智能内容提取 - 不限于1000字符"""
+        subject = email_data.get("subject", "")
+        body_text = email_data.get("body_text", "")
+        body_html = email_data.get("body_html", "")
+
+        # 如果没有纯文本，尝试从HTML提取
+        if not body_text and body_html:
+            body_text = re.sub(r"<[^>]+>", "", body_html)
+
+        # 智能截取策略
+        if len(body_text) <= 2000:
+            extracted_content = body_text
+        else:
+            head_part = body_text[:800]
+
+            # 查找包含关键词的重要段落
+            important_keywords = [
+                "案件",
+                "プロジェクト",
+                "開発",
+                "必須スキル",
+                "単価",
+                "期間",
+                "場所",
+                "エンジニア",
+                "履歴書",
+                "経験",
+                "希望",
+                "技術者",
+                "スキル",
+                "資格",
+            ]
+
+            important_parts = []
+            lines = body_text.split("\n")
+
+            for i, line in enumerate(lines):
+                line_score = sum(1 for keyword in important_keywords if keyword in line)
+                if line_score >= 2:
+                    start_idx = max(0, i - 1)
+                    end_idx = min(len(lines), i + 2)
+                    context = "\n".join(lines[start_idx:end_idx])
+                    important_parts.append(context)
+
+            tail_part = body_text[-300:] if len(body_text) > 300 else ""
+
+            extracted_content = head_part
+            if important_parts:
+                extracted_content += "\n\n【重要段落】\n" + "\n".join(
+                    important_parts[:2]
+                )
+            if tail_part:
+                extracted_content += "\n\n【末尾部分】\n" + tail_part
+
+        return extracted_content
+
+    def calculate_keyword_score(
+        self, text: str, email_type: str
+    ) -> Tuple[float, List[str]]:
+        """计算关键词得分"""
+        if email_type not in self.keywords:
+            return 0.0, []
+
+        found_keywords = []
+        score = 0.0
+        text_lower = text.lower()
+
+        keywords_dict = self.keywords[email_type]
+
+        # 高权重关键词
+        for keyword in keywords_dict["高权重"]:
+            if keyword in text_lower:
+                score += 3.0
+                found_keywords.append(f"高:{keyword}")
+
+        # 中权重关键词
+        for keyword in keywords_dict["中权重"]:
+            if keyword in text_lower:
+                score += 1.5
+                found_keywords.append(f"中:{keyword}")
+
+        return score, found_keywords
+
+    def check_spam_indicators(self, email_data: Dict) -> bool:
+        """检查垃圾邮件指标"""
+        subject = email_data.get("subject", "").lower()
+        body_text = email_data.get("body_text", "").lower()
+        sender_email = email_data.get("sender_email", "").lower()
+
+        combined_text = f"{subject} {body_text}"
+
+        spam_count = sum(
+            1 for keyword in self.exclusion_keywords if keyword in combined_text
+        )
+        sender_suspicious = any(
+            pattern in sender_email for pattern in self.sender_patterns["suspicious"]
+        )
+
+        return spam_count >= 2 or sender_suspicious
+
+    async def classify_email(self, email_data: Dict) -> EmailType:
+        """改进的邮件分类方法"""
+        try:
+            # 1. 垃圾邮件检测
+            if self.check_spam_indicators(email_data):
+                logger.info("检测到垃圾邮件特征，分类为unclassified")
+                return EmailType.UNCLASSIFIED
+
+            # 2. 附件分析
+            attachment_analysis = self.analyze_attachments(email_data)
+            if attachment_analysis["confidence"] > 0.8:
+                logger.info(
+                    f"强附件指标检测: {attachment_analysis['strong_type']}, 置信度: {attachment_analysis['confidence']:.2f}"
+                )
+                return EmailType(attachment_analysis["strong_type"])
+
+            # 3. 智能内容分析
+            extracted_content = self.smart_content_extraction(email_data)
+
+            # 关键词分析
+            project_score, project_keywords = self.calculate_keyword_score(
+                extracted_content, "project_related"
+            )
+            engineer_score, engineer_keywords = self.calculate_keyword_score(
+                extracted_content, "engineer_related"
+            )
+
+            # 发件人分析
+            sender_analysis = self.analyze_sender_info(email_data)
+
+            # 4. 高置信度关键词判断
+            if project_score > engineer_score + 2.0 and project_score > 4.0:
+                confidence = min(0.9, 0.7 + project_score * 0.03)
+                if sender_analysis["domain_type"] == "recruiting":
+                    confidence = min(0.95, confidence + 0.1)
+
+                logger.info(
+                    f"项目关键词高分: {project_score}, 置信度: {confidence:.2f}"
+                )
+                logger.debug(f"关键词: {project_keywords[:5]}")
+                return EmailType.PROJECT_RELATED
+
+            if engineer_score > project_score + 2.0 and engineer_score > 4.0:
+                confidence = min(0.9, 0.7 + engineer_score * 0.03)
+                logger.info(
+                    f"工程师关键词高分: {engineer_score}, 置信度: {confidence:.2f}"
+                )
+                logger.debug(f"关键词: {engineer_keywords[:5]}")
+                return EmailType.ENGINEER_RELATED
+
+            # 5. AI分析（如果关键词分析不够明确）
+            if self.ai_client:
+                ai_result = await self._call_ai_classifier(
+                    email_data, extracted_content, sender_analysis
+                )
+
+                # 调整置信度
+                if sender_analysis["confidence"] > 0.5:
+                    logger.debug(
+                        f"发件人分析提升置信度: {sender_analysis['domain_type']}"
+                    )
+
+                return ai_result
+
+            # 6. 基础规则分类
+            return self._fallback_classification(
+                extracted_content,
+                project_score,
+                engineer_score,
+                project_keywords,
+                engineer_keywords,
+            )
+
+        except Exception as e:
+            logger.error(f"邮件分类过程出错: {e}")
+            return EmailType.UNCLASSIFIED
+
+    async def _call_ai_classifier(
+        self, email_data: Dict, extracted_content: str, sender_analysis: Dict
+    ) -> EmailType:
+        """调用AI进行分类"""
+        provider_name = self.ai_config.get("provider_name")
+        model_classify = self.ai_config.get("model_classify", "gpt-3.5-turbo")
+        temperature = self.ai_config.get("temperature", 0.1)
+        max_tokens = self.ai_config.get("max_tokens", 200)
+
+        # 构建增强提示词
+        prompt = f"""
+あなたは日本のIT業界の専門家です。以下のメール情報を分析してカテゴリーを判定してください。
+
+【メール内容】
+件名: {email_data.get('subject', '')}
+送信者: {email_data.get('sender_email', '')}
+本文: {extracted_content[:1500]}
+
+【発信者分析】
+タイプ: {sender_analysis['domain_type']}
+信頼度: {sender_analysis['confidence']:.2f}
+
+【分類基準】
+1. project_related: IT案件・プロジェクトの募集、技術要件や単価の記載
+2. engineer_related: エンジニア個人の紹介、履歴書送付、スキルアピール  
+3. other: 業界関連の重要メール（勉強会、サービス紹介等）
+4. unclassified: 無関係または spam
+
+【出力形式】
+{{"category": "カテゴリー名", "confidence": 0.0-1.0, "reasoning": "判定理由"}}
+
+JSON形式のみで回答してください。
+"""
+
+        messages = [
+            {"role": "system", "content": "あなたは高精度なメール分類の専門家です。"},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            if provider_name == "openai":
+                response = await self.ai_client.chat.completions.create(
+                    model=model_classify,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = response.choices[0].message.content.strip()
+
+            elif provider_name == "deepseek":
+                response = await self.ai_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": model_classify,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"].strip()
+            else:
+                raise ValueError(f"Unsupported AI provider: {provider_name}")
+
+            # 解析AI响应
+            try:
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    result = json.loads(content)
+
+                # 转换为EmailType
+                category_str = result.get("category", "unclassified")
+                confidence = float(result.get("confidence", 0.5))
+                reasoning = result.get("reasoning", "AI分析结果")
+
+                logger.info(f"AI分类结果: {category_str}, 置信度: {confidence:.2f}")
+                logger.debug(f"AI推理: {reasoning}")
+
+                if "project" in category_str:
+                    return EmailType.PROJECT_RELATED
+                elif "engineer" in category_str:
+                    return EmailType.ENGINEER_RELATED
+                elif "other" in category_str:
+                    return EmailType.OTHER
+                else:
+                    return EmailType.UNCLASSIFIED
+
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"AI响应解析失败: {e}, 内容: {content}")
+                return self._extract_category_from_text(content)
+
+        except Exception as e:
+            logger.error(f"AI分类调用失败: {e}")
+            return EmailType.UNCLASSIFIED
+
+    def _extract_category_from_text(self, text: str) -> EmailType:
+        """从文本中提取分类信息（AI返回非JSON时的备用方法）"""
+        text_lower = text.lower()
+
+        if "project" in text_lower:
+            return EmailType.PROJECT_RELATED
+        elif "engineer" in text_lower:
+            return EmailType.ENGINEER_RELATED
+        elif "other" in text_lower:
+            return EmailType.OTHER
+        else:
+            return EmailType.UNCLASSIFIED
+
+    def _fallback_classification(
+        self,
+        content: str,
+        project_score: float,
+        engineer_score: float,
+        project_keywords: List[str],
+        engineer_keywords: List[str],
+    ) -> EmailType:
+        """备用分类逻辑"""
+        logger.info(
+            f"使用备用分类逻辑 - 项目得分: {project_score}, 工程师得分: {engineer_score}"
+        )
+
+        if project_score > engineer_score and project_score > 1.0:
+            logger.debug(f"备用分类: project_related, 关键词: {project_keywords[:3]}")
+            return EmailType.PROJECT_RELATED
+        elif engineer_score > 1.0:
+            logger.debug(f"备用分类: engineer_related, 关键词: {engineer_keywords[:3]}")
+            return EmailType.ENGINEER_RELATED
+        elif any(
+            word in content.lower() for word in ["説明会", "案内", "勉強会", "技術"]
+        ):
+            logger.debug("备用分类: other")
+            return EmailType.OTHER
+        else:
+            logger.debug("备用分类: unclassified")
+            return EmailType.UNCLASSIFIED
+
+    # ===============================
+    # 其他现有方法保持不变
+    # ===============================
 
     async def get_smtp_settings(self, tenant_id: str) -> List[SMTPSettings]:
         """テナントのSMTP設定を取得"""
@@ -291,7 +777,6 @@ class EmailProcessor:
 
             settings = []
             for row in rows:
-                # NOTE: This decryption logic handles both string and bytes BYTEA fields
                 decrypted_password = None
                 try:
                     if row["smtp_password_encrypted"]:
@@ -299,7 +784,6 @@ class EmailProcessor:
 
                         # 处理PostgreSQL BYTEA字段类型转换
                         if isinstance(password_data, str):
-                            # 如果是字符串（十六进制编码），转换为字节
                             hex_str = password_data
                             if hex_str.startswith("\\x"):
                                 hex_str = hex_str[2:]
@@ -314,7 +798,6 @@ class EmailProcessor:
                                 )
                                 continue
                         elif isinstance(password_data, bytes):
-                            # 正常的字节类型处理
                             decrypted_password = decrypt(
                                 password_data, Config.ENCRYPTION_KEY
                             )
@@ -345,7 +828,6 @@ class EmailProcessor:
                         security_protocol=row["security_protocol"],
                         from_email=row["from_email"],
                         from_name=row["from_name"],
-                        # IMAPホストは通常SMTPホストから推測
                         imap_host=row["smtp_host"].replace("smtp.", "imap."),
                     )
                 )
@@ -449,105 +931,8 @@ class EmailProcessor:
             "received_at": datetime.now(),
         }
 
-    async def classify_email(self, email_data: Dict) -> EmailType:
-        """AIを使用してメールを分類"""
-        if not self.ai_client:
-            logger.warning("AI client not initialized. Skipping email classification.")
-            return EmailType.UNCLASSIFIED
-
-        provider_name = self.ai_config.get("provider_name")
-        model_classify = self.ai_config.get(
-            "model_classify", "gpt-3.5-turbo"
-        )  # Default for safety
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_classify = self.ai_config.get(
-            "max_tokens", 50
-        )  # Use general max_tokens or a specific one
-
-        prompt = f"""
-        以下のメールを分析して、カテゴリーを判定してください。
-        
-        件名: {email_data['subject']}
-        本文: {email_data['body_text'][:1000]}
-        
-        カテゴリー:
-        1. project_related - 案件に関するメール（求人、プロジェクト募集など）
-        2. engineer_related - 技術者に関するメール（履歴書、スキルシートなど）
-        3. other - その他の重要なメール
-        4. unclassified - 分類不能または無関係なメール
-        
-        カテゴリー名のみを回答してください。
-        """
-
-        messages = [
-            {"role": "system", "content": "あなたはメール分類の専門家です。"},
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
-                    model=model_classify,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens_classify,
-                )
-                category = response.choices[0].message.content.strip().lower()
-            elif provider_name == "deepseek":
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    # DeepSeek API call (example, adjust path and payload as needed)
-                    try:
-                        response = await self.ai_client.post(
-                            "/v1/chat/completions",  # Or specific DeepSeek endpoint path
-                            json={
-                                "model": model_classify,
-                                "messages": messages,
-                                "temperature": temperature,
-                                "max_tokens": max_tokens_classify,
-                            },
-                        )
-                        response.raise_for_status()  # Raise an exception for HTTP errors
-                        data = response.json()
-                        category = (
-                            data["choices"][0]["message"]["content"].strip().lower()
-                        )
-                    except httpx.ReadTimeout as e:
-                        logger.error(f"DeepSeek API timeout during classification: {e}")
-                        return EmailType.UNCLASSIFIED
-                    except httpx.HTTPStatusError as e:
-                        logger.error(
-                            f"DeepSeek API HTTP error during classification: {e}"
-                        )
-                        return EmailType.UNCLASSIFIED
-                    except KeyError as e:
-                        logger.error(
-                            f"DeepSeek API response format error during classification: {e}"
-                        )
-                        return EmailType.UNCLASSIFIED
-                else:  # Deepseek client not properly initialized as httpx.AsyncClient
-                    logger.warning(
-                        "DeepSeek client not an httpx.AsyncClient. Skipping classification."
-                    )
-                    return EmailType.UNCLASSIFIED
-            else:
-                logger.warning(
-                    f"Unsupported AI provider for classification: {provider_name}"
-                )
-                return EmailType.UNCLASSIFIED
-
-            # Enumに変換
-            if "project" in category:
-                return EmailType.PROJECT_RELATED
-            elif "engineer" in category:
-                return EmailType.ENGINEER_RELATED
-            elif "other" in category:
-                return EmailType.OTHER
-            else:
-                return EmailType.UNCLASSIFIED
-
-        except Exception as e:
-            logger.error(f"Error classifying email: {e}")
-            return EmailType.UNCLASSIFIED
+    # 其他方法（extract_project_info, extract_engineer_info, save_email_to_db 等）保持不变
+    # 为了简洁起见，这里不重复贴出所有方法，但实际使用时需要保留所有现有方法
 
     async def extract_project_info(
         self, email_data: Dict
@@ -560,19 +945,18 @@ class EmailProcessor:
             return None
 
         provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get(
-            "model_extract", "gpt-4"
-        )  # Default for safety
+        model_extract = self.ai_config.get("model_extract", "gpt-4")
         temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get(
-            "max_tokens", 2048
-        )  # Use general max_tokens
+        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+
+        # 使用智能内容提取
+        extracted_content = self.smart_content_extraction(email_data)
 
         prompt = f"""
         以下のメールから案件情報を抽出して、必ずJSON形式で返してください。他の説明は不要です。
 
         件名: {email_data['subject']}
-        本文: {email_data['body_text']}
+        本文: {extracted_content}
         
         以下の形式で抽出してください：
         {{
@@ -611,14 +995,12 @@ class EmailProcessor:
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens_extract,
-                    # response_format パラメータを削除
                 )
                 raw_content = response.choices[0].message.content
                 data = self._extract_json_from_text(raw_content)
 
             elif provider_name == "deepseek":
                 if isinstance(self.ai_client, httpx.AsyncClient):
-                    # DeepSeek API call (example, adjust path and payload as needed)
                     try:
                         logger.info(
                             "Sending request to DeepSeek API for project extraction..."
@@ -628,7 +1010,7 @@ class EmailProcessor:
                         )
 
                         response = await self.ai_client.post(
-                            "/v1/chat/completions",  # Or specific DeepSeek endpoint path
+                            "/v1/chat/completions",
                             json={
                                 "model": model_extract,
                                 "messages": messages,
@@ -655,7 +1037,6 @@ class EmailProcessor:
                         logger.info(f"Raw content:\n{raw_response_content}")
                         logger.info("=== End Raw Content ===")
 
-                        # 同时打印到控制台
                         print("\n" + "=" * 50)
                         print("DeepSeek API 返回内容:")
                         print("=" * 50)
@@ -693,7 +1074,7 @@ class EmailProcessor:
                         )
                         print(f"❌ DeepSeek API 响应格式错误: {e}")
                         return None
-                else:  # Deepseek client not properly initialized
+                else:
                     logger.warning(
                         "DeepSeek client not an httpx.AsyncClient. Skipping project info extraction."
                     )
@@ -733,19 +1114,18 @@ class EmailProcessor:
             return None
 
         provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get(
-            "model_extract", "gpt-4"
-        )  # Default for safety
+        model_extract = self.ai_config.get("model_extract", "gpt-4")
         temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get(
-            "max_tokens", 2048
-        )  # Use general max_tokens
+        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+
+        # 使用智能内容提取
+        extracted_content = self.smart_content_extraction(email_data)
 
         prompt = f"""
         以下のメールから技術者情報を抽出して、必ずJSON形式で返してください。他の説明は不要です。
         
         件名: {email_data['subject']}
-        本文: {email_data['body_text']}
+        本文: {extracted_content}
         
         以下の形式で抽出してください：
         {{
@@ -779,14 +1159,12 @@ class EmailProcessor:
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens_extract,
-                    # response_format パラメータを削除
                 )
                 raw_content = response.choices[0].message.content
                 data = self._extract_json_from_text(raw_content)
 
             elif provider_name == "deepseek":
                 if isinstance(self.ai_client, httpx.AsyncClient):
-                    # DeepSeek API call (example, adjust path and payload as needed)
                     try:
                         logger.info(
                             "Sending request to DeepSeek API for engineer extraction..."
@@ -796,7 +1174,7 @@ class EmailProcessor:
                         )
 
                         response = await self.ai_client.post(
-                            "/v1/chat/completions",  # Or specific DeepSeek endpoint path
+                            "/v1/chat/completions",
                             json={
                                 "model": model_extract,
                                 "messages": messages,
@@ -823,7 +1201,6 @@ class EmailProcessor:
                         logger.info(f"Raw content:\n{raw_response_content}")
                         logger.info("=== End Raw Content ===")
 
-                        # 同时打印到控制台
                         print("\n" + "=" * 50)
                         print("DeepSeek API 返回内容 (工程师信息):")
                         print("=" * 50)
@@ -861,7 +1238,7 @@ class EmailProcessor:
                         )
                         print(f"❌ DeepSeek API 响应格式错误: {e}")
                         return None
-                else:  # Deepseek client not properly initialized
+                else:
                     logger.warning(
                         "DeepSeek client not an httpx.AsyncClient. Skipping engineer info extraction."
                     )
@@ -894,7 +1271,6 @@ class EmailProcessor:
     ) -> str:
         """メールをデータベースに保存"""
         async with self.db_pool.acquire() as conn:
-            # receive_emailsテーブルに保存
             email_id = await conn.fetchval(
                 """
                 INSERT INTO receive_emails (
@@ -930,10 +1306,8 @@ class EmailProcessor:
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
                 try:
-                    # 日期处理
                     start_date_value = None
                     if project_data.start_date:
-                        # 再次验证和转换日期格式
                         normalized_date = self._parse_date_string(
                             project_data.start_date
                         )
@@ -956,7 +1330,6 @@ class EmailProcessor:
                             )
                             start_date_value = None
 
-                    # projectsテーブルに保存
                     project_id = await conn.fetchval(
                         """
                         INSERT INTO projects (
@@ -979,7 +1352,7 @@ class EmailProcessor:
                         project_data.description,
                         project_data.skills,
                         project_data.location,
-                        start_date_value,  # 使用处理后的日期值
+                        start_date_value,
                         project_data.duration,
                         project_data.budget,
                         project_data.japanese_level,
@@ -989,7 +1362,6 @@ class EmailProcessor:
                         datetime.now(),
                     )
 
-                    # receive_emailsテーブルを更新
                     await conn.execute(
                         """
                         UPDATE receive_emails 
@@ -1033,7 +1405,6 @@ class EmailProcessor:
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
                 try:
-                    # engineersテーブルに保存
                     engineer_id = await conn.fetchval(
                         """
                         INSERT INTO engineers (
@@ -1062,7 +1433,6 @@ class EmailProcessor:
                         datetime.now(),
                     )
 
-                    # receive_emailsテーブルを更新
                     await conn.execute(
                         """
                         UPDATE receive_emails 
@@ -1097,7 +1467,6 @@ class EmailProcessor:
 
     async def process_emails_for_tenant(self, tenant_id: str):
         """特定テナントのメール処理を実行"""
-        # SMTP設定を取得
         settings_list = await self.get_smtp_settings(tenant_id)
 
         if not settings_list:
@@ -1106,21 +1475,18 @@ class EmailProcessor:
 
         for settings in settings_list:
             try:
-                # メールを取得
                 emails = await self.fetch_emails(settings)
                 logger.info(f"Fetched {len(emails)} new emails for tenant {tenant_id}")
 
                 for email_data in emails:
-                    # メールを分類
+                    # 使用改进的分类方法
                     email_type = await self.classify_email(email_data)
                     logger.info(f"Email classified as: {email_type.value}")
 
-                    # データベースに保存
                     email_id = await self.save_email_to_db(
                         tenant_id, email_data, email_type, None
                     )
 
-                    # 案件関連の場合
                     if email_type == EmailType.PROJECT_RELATED:
                         project_data = await self.extract_project_info(email_data)
                         if project_data:
@@ -1131,7 +1497,6 @@ class EmailProcessor:
                                 email_data["sender_email"],
                             )
 
-                    # 技術者関連の場合
                     elif email_type == EmailType.ENGINEER_RELATED:
                         engineer_data = await self.extract_engineer_info(email_data)
                         if engineer_data:
@@ -1142,7 +1507,6 @@ class EmailProcessor:
                                 email_data["sender_email"],
                             )
 
-                    # その他の場合は処理済みとマーク
                     else:
                         async with self.db_pool.acquire() as conn:
                             await conn.execute(
@@ -1162,7 +1526,7 @@ class EmailProcessor:
 
 # バッチ処理用のメイン関数
 async def main():
-    # データベース設定
+    """バッチ処理用のメイン関数"""
     db_config = {
         "host": os.getenv("DB_HOST", "localhost"),
         "port": os.getenv("DB_PORT", 5432),
@@ -1171,20 +1535,14 @@ async def main():
         "password": os.getenv("DB_PASSWORD", ""),
     }
 
-    # AI設定
-    # Config.get_ai_config() will be used by the EmailProcessor constructor internally
-    # For the main function, we can pass the result of Config.get_ai_config()
-    # which now includes the provider_name and specific settings for that provider.
-    active_ai_config = Config.get_ai_config()  # Gets config for the DEFAULT_AI_PROVIDER
+    active_ai_config = Config.get_ai_config()
 
-    # プロセッサーの初期化
     processor = EmailProcessor(
         db_config=Config.get_db_config(), ai_config=active_ai_config
     )
     await processor.initialize()
 
     try:
-        # すべてのアクティブなテナントを取得
         async with processor.db_pool.acquire() as conn:
             tenant_ids = await conn.fetch(
                 """
@@ -1195,7 +1553,6 @@ async def main():
             """
             )
 
-        # 各テナントのメールを処理
         for row in tenant_ids:
             tenant_id = str(row["id"])
             logger.info(f"Processing emails for tenant: {tenant_id}")
@@ -1208,5 +1565,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # 定期実行用（cronやスケジューラーで実行）
     asyncio.run(main())
