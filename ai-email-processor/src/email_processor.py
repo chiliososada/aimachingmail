@@ -1,5 +1,5 @@
 # src/email_processor.py
-"""主要邮件处理模块 - 重构版（修复Pydantic验证错误）"""
+"""主要邮件处理模块 - 重构版（修复Pydantic验证错误和数据库约束问题）"""
 
 import os
 import json
@@ -87,13 +87,13 @@ class ProjectStructured(BaseModel):
 
 
 class EngineerStructured(BaseModel):
-    """構造化された技術者データ - 改进版本，支持类型自动转换"""
+    """構造化された技術者データ - 完全修复版本，支持数据库约束"""
 
     name: str
     email: Optional[str] = None
     phone: Optional[str] = None
     gender: Optional[str] = None
-    age: Optional[str] = None  # 保持为字符串类型
+    age: Optional[str] = None
     nationality: Optional[str] = None
     nearest_station: Optional[str] = None
     education: Optional[str] = None
@@ -107,6 +107,7 @@ class EngineerStructured(BaseModel):
     japanese_level: Optional[str] = None
     english_level: Optional[str] = None
     availability: Optional[str] = None
+    current_status: Optional[str] = "提案中"
     preferred_work_style: List[str] = Field(default_factory=list)
     preferred_locations: List[str] = Field(default_factory=list)
     desired_rate_min: Optional[int] = None
@@ -117,6 +118,22 @@ class EngineerStructured(BaseModel):
     remarks: Optional[str] = None
     recommendation: Optional[str] = None
     source_filename: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        """姓名验证器 - 确保不为空"""
+        if not v or v is None:
+            return "名前不明"
+        return str(v)
+
+    @field_validator("experience")
+    @classmethod
+    def validate_experience(cls, v):
+        """经验验证器 - 确保不为空"""
+        if not v or v is None:
+            return "不明"
+        return str(v)
 
     @field_validator("age")
     @classmethod
@@ -130,10 +147,161 @@ class EngineerStructured(BaseModel):
             return v
         return str(v)
 
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        """电话号码验证器 - 将数字转换为字符串"""
+        if v is None:
+            return None
+        return str(v)
+
+    @field_validator("gender")
+    @classmethod
+    def validate_gender(cls, v):
+        """性别验证器 - 映射到数据库允许值"""
+        if v is None:
+            return None
+
+        v_str = str(v).lower()
+
+        if any(word in v_str for word in ["男", "male", "m"]):
+            return "男性"
+        elif any(word in v_str for word in ["女", "female", "f"]):
+            return "女性"
+        else:
+            return "回答しない"
+
+    @field_validator("japanese_level", "english_level")
+    @classmethod
+    def validate_language_level(cls, v):
+        """语言水平验证器 - 标准化为数据库允许的值"""
+        if v is None:
+            return None
+
+        v_str = str(v).lower()
+
+        # 语言水平映射规则
+        mappings = {
+            # N级别和数字等级映射
+            "n1": "ネイティブレベル",
+            "n2": "ビジネスレベル",
+            "n3": "日常会話レベル",
+            "n4": "日常会話レベル",
+            "n5": "日常会話レベル",
+            "1級": "ネイティブレベル",
+            "2級": "ビジネスレベル",
+            "3級": "日常会話レベル",
+            "4級": "日常会話レベル",
+            "5級": "日常会話レベル",
+            # 流暢度描述映射
+            "ネイティブ": "ネイティブレベル",
+            "native": "ネイティブレベル",
+            "ほぼ流暢": "ビジネスレベル",
+            "流暢": "ビジネスレベル",
+            "fluent": "ビジネスレベル",
+            "ビジネス": "ビジネスレベル",
+            "business": "ビジネスレベル",
+            "日常会話": "日常会話レベル",
+            "conversational": "日常会話レベル",
+            "基本": "日常会話レベル",
+            "basic": "日常会話レベル",
+            "初級": "日常会話レベル",
+            "中級": "日常会話レベル",
+            "上級": "ビジネスレベル",
+            "advanced": "ビジネスレベル",
+            "不問": "不問",
+            "問わない": "不問",
+            "なし": "不問",
+            "none": "不問",
+        }
+
+        # 尝试直接映射
+        for key, mapped_value in mappings.items():
+            if key in v_str:
+                logger.info(f"语言水平映射: '{v}' -> '{mapped_value}'")
+                return mapped_value
+
+        # 如果包含数字，尝试提取等级
+        import re
+
+        numbers = re.findall(r"[1-5]", v_str)
+        if numbers:
+            level = int(numbers[0])
+            if level == 1:
+                return "ネイティブレベル"
+            elif level == 2:
+                return "ビジネスレベル"
+            else:
+                return "日常会話レベル"
+
+        # 默认映射策略
+        if any(
+            word in v_str
+            for word in ["上級", "高級", "1級", "n1", "ネイティブ", "native"]
+        ):
+            return "ネイティブレベル"
+        elif any(
+            word in v_str
+            for word in ["ビジネス", "business", "2級", "n2", "流暢", "fluent"]
+        ):
+            return "ビジネスレベル"
+        elif any(
+            word in v_str
+            for word in ["会話", "conversational", "3級", "4級", "n3", "n4"]
+        ):
+            return "日常会話レベル"
+        elif any(word in v_str for word in ["不問", "問わない", "なし", "none"]):
+            return "不問"
+        else:
+            # 如果无法识别，默认设为日常会话级
+            logger.warning(f"无法识别的语言水平: '{v}'，默认设为日常会話レベル")
+            return "日常会話レベル"
+
+    @field_validator("current_status")
+    @classmethod
+    def validate_current_status(cls, v):
+        """状态验证器 - 确保值在允许范围内"""
+        if v is None:
+            return "提案中"  # 默认状态
+
+        # 数据库允许的状态值
+        allowed_statuses = [
+            "提案中",
+            "事前面談",
+            "面談",
+            "結果待ち",
+            "契約中",
+            "営業終了",
+            "アーカイブ",
+        ]
+
+        v_str = str(v)
+        if v_str in allowed_statuses:
+            return v_str
+
+        # 状态映射
+        status_mappings = {
+            "新規": "提案中",
+            "提案": "提案中",
+            "面接": "面談",
+            "面接中": "面談",
+            "結果": "結果待ち",
+            "契約": "契約中",
+            "終了": "営業終了",
+            "完了": "営業終了",
+        }
+
+        for key, mapped_status in status_mappings.items():
+            if key in v_str:
+                return mapped_status
+
+        # 默认返回"提案中"
+        return "提案中"
+
     @field_validator("preferred_work_style")
     @classmethod
     def validate_preferred_work_style(cls, v):
-        """希望勤务形态验证器 - 处理None值"""
+        """希望勤务形态验证器"""
         if v is None:
             return []
         if isinstance(v, list):
@@ -145,7 +313,7 @@ class EngineerStructured(BaseModel):
     @field_validator("preferred_locations")
     @classmethod
     def validate_preferred_locations(cls, v):
-        """希望勤务地验证器 - 处理None值"""
+        """希望勤务地验证器"""
         if v is None:
             return []
         if isinstance(v, list):
@@ -190,14 +358,6 @@ class EngineerStructured(BaseModel):
             return [item.strip() for item in v.split(",") if item.strip()]
         return []
 
-    @field_validator("phone")
-    @classmethod
-    def validate_phone(cls, v):
-        """电话号码验证器 - 将数字转换为字符串"""
-        if v is None:
-            return None
-        return str(v)
-
     @field_validator("desired_rate_min", "desired_rate_max")
     @classmethod
     def validate_rate(cls, v):
@@ -225,24 +385,8 @@ class EngineerStructured(BaseModel):
         if isinstance(v, bool):
             return v
         if isinstance(v, str):
-            return v.lower() in ("true", "yes", "可能", "可", "ok", "対応可能")
+            return v.lower() in ("true", "yes", "可能", "可", "ok", "対応可能", "はい")
         return False
-
-    @field_validator("experience")
-    @classmethod
-    def validate_experience(cls, v):
-        """经验验证器 - 确保不为空"""
-        if not v or v is None:
-            return "不明"
-        return str(v)
-
-    @field_validator("name")
-    @classmethod
-    def validate_name(cls, v):
-        """姓名验证器 - 确保不为空"""
-        if not v or v is None:
-            return "名前不明"
-        return str(v)
 
 
 class EmailProcessor:
@@ -902,7 +1046,7 @@ class EmailProcessor:
     async def extract_engineer_info(
         self, email_data: Dict
     ) -> Optional[EngineerStructured]:
-        """メールから技術者情報を抽出（邮件本文）- 改进版本"""
+        """メールから技術者情報を抽出（邮件本文）- 改进版本，使用标准化提示词"""
         if not self.ai_client:
             return None
 
@@ -913,20 +1057,20 @@ class EmailProcessor:
 
         extracted_content = self.classifier.smart_content_extraction(email_data)
 
-        # 优化后的AI提示词 - 明确数据类型要求
+        # 使用改进的提示词，明确数据库约束
         prompt = f"""
         以下のメールから技術者情報を抽出して、必ずJSON形式で返してください。
-        
-        件名: {email_data['subject']}
-        本文: {extracted_content}
-        
-        以下の形式で抽出してください（データ型に注意）：
+
+        件名: {email_data.get('subject', '')}
+        本文: {extracted_content[:1500]}
+
+        以下の形式で抽出してください（データ型と制約に注意）：
         {{
             "name": "技術者名（文字列、必須）",
             "email": "メールアドレス（文字列またはnull）",
             "phone": "電話番号（文字列またはnull）",
-            "gender": "性別（文字列またはnull）",
-            "age": "27"（文字列形式で年齢、数字ではなく文字列として）,
+            "gender": "性別（'男性', '女性', '回答しない' のいずれかまたはnull）",
+            "age": "27"（文字列形式で年齢）,
             "nationality": "国籍（文字列またはnull）",
             "nearest_station": "最寄り駅（文字列またはnull）",
             "education": "学歴（文字列またはnull）",
@@ -937,9 +1081,10 @@ class EmailProcessor:
             "experience": "5年"（文字列、必須）,
             "work_scope": "作業範囲（文字列またはnull）",
             "work_experience": "職務経歴（文字列またはnull）",
-            "japanese_level": "日本語レベル（文字列またはnull）",
-            "english_level": "英語レベル（文字列またはnull）",
+            "japanese_level": "ビジネスレベル"（必ず以下のいずれか: "不問", "日常会話レベル", "ビジネスレベル", "ネイティブレベル"）,
+            "english_level": "日常会話レベル"（必ず以下のいずれか: "不問", "日常会話レベル", "ビジネスレベル", "ネイティブレベル"）,
             "availability": "稼働可能時期（文字列またはnull）",
+            "current_status": "提案中"（以下のいずれか: "提案中", "事前面談", "面談", "結果待ち", "契約中", "営業終了", "アーカイブ"）,
             "preferred_work_style": ["常駐", "リモート"]（文字列の配列、空の場合は[]）,
             "preferred_locations": ["東京", "大阪"]（文字列の配列、空の場合は[]）,
             "desired_rate_min": 40（数値のみ、万円単位、不明の場合はnull）,
@@ -950,21 +1095,34 @@ class EmailProcessor:
             "remarks": "備考（文字列またはnull）",
             "recommendation": "推薦コメント（文字列またはnull）"
         }}
-        
-        重要な指示：
+
+        重要な制約事項：
         1. nameとexperienceは必須フィールドです
-        2. 年齢は文字列として返してください（例："27"）
-        3. 配列フィールド（skills, certifications等）でデータがない場合は[]を返してください、nullではありません
-        4. 数値フィールド（desired_rate_min/max）は純粋な数値のみ、文字列ではありません
-        5. 布尔值フィールドはtrue/falseのみ、文字列ではありません
-        6. 情報が見つからない項目はnullにしてください
-        7. JSONのみを返してください、他の説明は不要です
+        2. japanese_levelとenglish_levelは必ず以下の4つの値のみを使用：
+           - "不問" - 要求なし
+           - "日常会話レベル" - N3-N5級、基本会話
+           - "ビジネスレベル" - N2級、ビジネス会話
+           - "ネイティブレベル" - N1級、流暢
+        3. genderは "男性", "女性", "回答しない" のいずれかのみ
+        4. current_statusは "提案中", "事前面談", "面談", "結果待ち", "契約中", "営業終了", "アーカイブ" のいずれか
+        5. 配列フィールドでデータがない場合は[]、nullではありません
+        6. 数値フィールドは純粋な数値のみ
+        7. 布尔值フィールドはtrue/falseのみ
+        8. JSONのみを返してください、他の説明は不要です
+
+        言語レベル変換例：
+        - "日本語1級", "N1", "流暢", "ほぼ流暢" → "ネイティブレベル"
+        - "日本語2級", "N2", "ビジネス" → "ビジネスレベル"  
+        - "日本語3級", "N3", "会話", "基本" → "日常会話レベル"
+        - 不明・記載なし → "不問"
 
         例：
         {{
             "name": "燕",
             "age": "27",
             "gender": "男性",
+            "japanese_level": "ビジネスレベル",
+            "english_level": "不問",
             "skills": ["Java", "Spring Boot", "JavaScript"],
             "preferred_work_style": [],
             "preferred_locations": [],
@@ -978,7 +1136,7 @@ class EmailProcessor:
         messages = [
             {
                 "role": "system",
-                "content": "あなたは技術者情報抽出の専門家です。必ずJSONのみを返してください。",
+                "content": "あなたは技術者情報抽出の専門家です。データベース制約を厳密に守り、必ずJSONのみを返してください。",
             },
             {"role": "user", "content": prompt},
         ]
@@ -1013,8 +1171,11 @@ class EmailProcessor:
                     data = self._extract_json_from_text(raw_response_content)
 
             if data:
-                logger.info(f"成功提取工程师数据: {data.get('name', 'Unknown')}")
-                return EngineerStructured(**data)
+                logger.info(f"AI提取的原始数据: {data}")
+                # 使用更新的验证器创建EngineerStructured实例
+                engineer_data = EngineerStructured(**data)
+                logger.info(f"成功提取并验证工程师数据: {engineer_data.name}")
+                return engineer_data
 
         except Exception as e:
             logger.error(f"Error extracting engineer info: {e}")
@@ -1050,8 +1211,8 @@ class EmailProcessor:
                         ) VALUES (
                             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                            $23, $24, $25, $26, $27, $28, '他社', 'mail', '提案中',
-                            $29
+                            $23, $24, $25, $26, $27, $28, '他社', 'mail', $29,
+                            $30
                         )
                         RETURNING id
                     """,
@@ -1083,6 +1244,7 @@ class EmailProcessor:
                         engineer_data.self_promotion,
                         engineer_data.remarks,
                         engineer_data.recommendation,
+                        engineer_data.current_status or "提案中",
                         datetime.now(),
                     )
 
