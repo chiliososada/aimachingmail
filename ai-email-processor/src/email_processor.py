@@ -1,5 +1,5 @@
 # src/email_processor.py
-"""主要邮件处理模块 - 重构版"""
+"""主要邮件处理模块 - 重构版（修复Pydantic验证错误）"""
 
 import os
 import json
@@ -18,7 +18,7 @@ from enum import Enum
 import asyncpg
 from openai import AsyncOpenAI
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
 from src.encryption_utils import decrypt, DecryptionError
@@ -87,13 +87,13 @@ class ProjectStructured(BaseModel):
 
 
 class EngineerStructured(BaseModel):
-    """構造化された技術者データ"""
+    """構造化された技術者データ - 改进版本，支持类型自动转换"""
 
     name: str
     email: Optional[str] = None
     phone: Optional[str] = None
     gender: Optional[str] = None
-    age: Optional[str] = None
+    age: Optional[str] = None  # 保持为字符串类型
     nationality: Optional[str] = None
     nearest_station: Optional[str] = None
     education: Optional[str] = None
@@ -101,7 +101,7 @@ class EngineerStructured(BaseModel):
     certifications: List[str] = Field(default_factory=list)
     skills: List[str] = Field(default_factory=list)
     technical_keywords: List[str] = Field(default_factory=list)
-    experience: str
+    experience: str = ""
     work_scope: Optional[str] = None
     work_experience: Optional[str] = None
     japanese_level: Optional[str] = None
@@ -116,6 +116,133 @@ class EngineerStructured(BaseModel):
     self_promotion: Optional[str] = None
     remarks: Optional[str] = None
     recommendation: Optional[str] = None
+    source_filename: Optional[str] = None
+
+    @field_validator("age")
+    @classmethod
+    def validate_age(cls, v):
+        """年龄字段验证器 - 将数字转换为字符串"""
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    @field_validator("preferred_work_style")
+    @classmethod
+    def validate_preferred_work_style(cls, v):
+        """希望勤务形态验证器 - 处理None值"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("preferred_locations")
+    @classmethod
+    def validate_preferred_locations(cls, v):
+        """希望勤务地验证器 - 处理None值"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("certifications")
+    @classmethod
+    def validate_certifications(cls, v):
+        """资格验证器"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("skills")
+    @classmethod
+    def validate_skills(cls, v):
+        """技能验证器"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("technical_keywords")
+    @classmethod
+    def validate_technical_keywords(cls, v):
+        """技术关键词验证器"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v):
+        """电话号码验证器 - 将数字转换为字符串"""
+        if v is None:
+            return None
+        return str(v)
+
+    @field_validator("desired_rate_min", "desired_rate_max")
+    @classmethod
+    def validate_rate(cls, v):
+        """单价验证器 - 处理字符串数字"""
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            # 尝试从字符串中提取数字
+            import re
+
+            numbers = re.findall(r"\d+", v)
+            if numbers:
+                return int(numbers[0])
+            return None
+        return None
+
+    @field_validator("overtime_available", "business_trip_available")
+    @classmethod
+    def validate_boolean(cls, v):
+        """布尔值验证器"""
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "yes", "可能", "可", "ok", "対応可能")
+        return False
+
+    @field_validator("experience")
+    @classmethod
+    def validate_experience(cls, v):
+        """经验验证器 - 确保不为空"""
+        if not v or v is None:
+            return "不明"
+        return str(v)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        """姓名验证器 - 确保不为空"""
+        if not v or v is None:
+            return "名前不明"
+        return str(v)
 
 
 class EmailProcessor:
@@ -775,7 +902,7 @@ class EmailProcessor:
     async def extract_engineer_info(
         self, email_data: Dict
     ) -> Optional[EngineerStructured]:
-        """メールから技術者情報を抽出（邮件本文）"""
+        """メールから技術者情報を抽出（邮件本文）- 改进版本"""
         if not self.ai_client:
             return None
 
@@ -786,44 +913,66 @@ class EmailProcessor:
 
         extracted_content = self.classifier.smart_content_extraction(email_data)
 
+        # 优化后的AI提示词 - 明确数据类型要求
         prompt = f"""
         以下のメールから技術者情報を抽出して、必ずJSON形式で返してください。
         
         件名: {email_data['subject']}
         本文: {extracted_content}
         
-        以下の形式で抽出してください：
+        以下の形式で抽出してください（データ型に注意）：
         {{
-            "name": "技術者名",
-            "email": "メールアドレス",
-            "phone": "電話番号",
-            "gender": "性別",
-            "age": "年齢",
-            "nationality": "国籍",
-            "nearest_station": "最寄り駅",
-            "education": "学歴",
-            "arrival_year_japan": "来日年度",
-            "certifications": ["資格1", "資格2"],
-            "skills": ["スキル1", "スキル2"],
-            "technical_keywords": ["技術キーワード1", "技術キーワード2"],
-            "experience": "経験年数",
-            "work_scope": "作業範囲",
-            "work_experience": "職務経歴",
-            "japanese_level": "日本語レベル",
-            "english_level": "英語レベル",
-            "availability": "稼働可能時期",
-            "preferred_work_style": ["希望勤務形態1", "希望勤務形態2"],
-            "preferred_locations": ["希望勤務地1", "希望勤務地2"],
-            "desired_rate_min": "希望単価下限（数値のみ）",
-            "desired_rate_max": "希望単価上限（数値のみ）",
-            "overtime_available": "残業対応可能（true/false）",
-            "business_trip_available": "出張対応可能（true/false）",
-            "self_promotion": "自己PR",
-            "remarks": "備考",
-            "recommendation": "推薦コメント"
+            "name": "技術者名（文字列、必須）",
+            "email": "メールアドレス（文字列またはnull）",
+            "phone": "電話番号（文字列またはnull）",
+            "gender": "性別（文字列またはnull）",
+            "age": "27"（文字列形式で年齢、数字ではなく文字列として）,
+            "nationality": "国籍（文字列またはnull）",
+            "nearest_station": "最寄り駅（文字列またはnull）",
+            "education": "学歴（文字列またはnull）",
+            "arrival_year_japan": "来日年度（文字列またはnull）",
+            "certifications": ["資格1", "資格2"]（文字列の配列、空の場合は[]）,
+            "skills": ["Java", "Python", "Spring"]（文字列の配列、空の場合は[]）,
+            "technical_keywords": ["Java", "Spring Boot", "MySQL"]（文字列の配列、空の場合は[]）,
+            "experience": "5年"（文字列、必須）,
+            "work_scope": "作業範囲（文字列またはnull）",
+            "work_experience": "職務経歴（文字列またはnull）",
+            "japanese_level": "日本語レベル（文字列またはnull）",
+            "english_level": "英語レベル（文字列またはnull）",
+            "availability": "稼働可能時期（文字列またはnull）",
+            "preferred_work_style": ["常駐", "リモート"]（文字列の配列、空の場合は[]）,
+            "preferred_locations": ["東京", "大阪"]（文字列の配列、空の場合は[]）,
+            "desired_rate_min": 40（数値のみ、万円単位、不明の場合はnull）,
+            "desired_rate_max": 50（数値のみ、万円単位、不明の場合はnull）,
+            "overtime_available": false（true/false、不明の場合はfalse）,
+            "business_trip_available": false（true/false、不明の場合はfalse）,
+            "self_promotion": "自己PR（文字列またはnull）",
+            "remarks": "備考（文字列またはnull）",
+            "recommendation": "推薦コメント（文字列またはnull）"
         }}
         
-        情報が見つからない項目はnullにしてください。JSONのみを返してください。
+        重要な指示：
+        1. nameとexperienceは必須フィールドです
+        2. 年齢は文字列として返してください（例："27"）
+        3. 配列フィールド（skills, certifications等）でデータがない場合は[]を返してください、nullではありません
+        4. 数値フィールド（desired_rate_min/max）は純粋な数値のみ、文字列ではありません
+        5. 布尔值フィールドはtrue/falseのみ、文字列ではありません
+        6. 情報が見つからない項目はnullにしてください
+        7. JSONのみを返してください、他の説明は不要です
+
+        例：
+        {{
+            "name": "燕",
+            "age": "27",
+            "gender": "男性",
+            "skills": ["Java", "Spring Boot", "JavaScript"],
+            "preferred_work_style": [],
+            "preferred_locations": [],
+            "desired_rate_min": 48,
+            "desired_rate_max": null,
+            "overtime_available": false,
+            "business_trip_available": false
+        }}
         """
 
         messages = [
@@ -864,10 +1013,14 @@ class EmailProcessor:
                     data = self._extract_json_from_text(raw_response_content)
 
             if data:
+                logger.info(f"成功提取工程师数据: {data.get('name', 'Unknown')}")
                 return EngineerStructured(**data)
 
         except Exception as e:
             logger.error(f"Error extracting engineer info: {e}")
+            import traceback
+
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return None
 
     async def save_engineer(
@@ -944,7 +1097,9 @@ class EmailProcessor:
                         email_id,
                     )
 
-                    logger.info(f"Engineer saved successfully: {engineer_id}")
+                    logger.info(
+                        f"Engineer saved successfully: {engineer_id} ({engineer_data.name})"
+                    )
                     return str(engineer_id)
 
                 except Exception as e:
