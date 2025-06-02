@@ -206,6 +206,7 @@ class AttachmentProcessor:
                     full_text.extend(sheet_text)
 
             text = "\n".join(full_text)
+            print(text)  # 👈 控制台输出内容
             logger.info(f"从Excel文档提取了 {len(text)} 字符的文本")
             return text
 
@@ -283,6 +284,7 @@ class AttachmentProcessor:
         self, resume_text: str, filename: str = ""
     ) -> Optional[ResumeData]:
         """使用AI从简历文本中提取结构化数据"""
+        logger.warning(f"resume_text: {resume_text}...")
         if not self.ai_client:
             logger.warning(
                 "AI client not initialized. Skipping resume data extraction."
