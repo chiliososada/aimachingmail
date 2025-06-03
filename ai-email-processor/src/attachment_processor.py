@@ -98,7 +98,7 @@ class AttachmentProcessor:
         if provider_name == "openai":
             if api_key:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
-        elif provider_name == "deepseek":
+        elif provider_name in ["deepseek", "custom"]:
             api_base_url = ai_config.get("api_base_url")
             timeout = ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
@@ -110,7 +110,9 @@ class AttachmentProcessor:
                     },
                     timeout=timeout,
                 )
-                logger.info("AttachmentProcessor AI client initialized")
+                logger.info(
+                    f"AttachmentProcessor {provider_name.title()} client initialized"
+                )
 
     def extract_text_from_docx(self, file_content: bytes) -> str:
         """从Word文档提取文本"""
@@ -371,10 +373,12 @@ class AttachmentProcessor:
                 raw_content = response.choices[0].message.content
                 data = self._extract_json_from_text(raw_content)
 
-            elif provider_name == "deepseek":
+            elif provider_name in ["deepseek", "custom"]:
                 if isinstance(self.ai_client, httpx.AsyncClient):
                     try:
-                        logger.info(f"发送简历解析请求到DeepSeek API: {filename}")
+                        logger.info(
+                            f"发送简历解析请求到{provider_name.title()} API: {filename}"
+                        )
 
                         response = await self.ai_client.post(
                             "/v1/chat/completions",
@@ -392,7 +396,9 @@ class AttachmentProcessor:
                             "content"
                         ]
 
-                        logger.info(f"=== DeepSeek 简历解析响应 ({filename}) ===")
+                        logger.info(
+                            f"=== {provider_name.title()} 简历解析响应 ({filename}) ==="
+                        )
                         logger.info(f"Raw content:\n{raw_response_content}")
 
                         data = self._extract_json_from_text(raw_response_content)
@@ -402,11 +408,13 @@ class AttachmentProcessor:
                             logger.error(f"JSON解析失败: {filename}")
 
                     except Exception as e:
-                        logger.error(f"DeepSeek API error for resume {filename}: {e}")
+                        logger.error(
+                            f"{provider_name.title()} API error for resume {filename}: {e}"
+                        )
                         return None
                 else:
                     logger.warning(
-                        "DeepSeek client not available for resume extraction"
+                        f"{provider_name.title()} client not available for resume extraction"
                     )
                     return None
             else:
@@ -492,7 +500,12 @@ class AttachmentProcessor:
                     continue
 
                 logger.info(f"从 {filename} 提取了 {len(resume_text)} 字符的文本")
-
+                print(f"\n{'='*60}")
+                print(f"📄 文件名: {filename}")
+                print(f"📝 提取的文本内容:")
+                print(f"{'='*60}")
+                print(resume_text)
+                print(f"{'='*60}\n")
                 # 使用AI提取结构化数据
                 resume_data = await self.extract_resume_data_with_ai(
                     resume_text, filename

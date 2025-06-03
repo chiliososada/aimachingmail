@@ -408,7 +408,7 @@ class EmailProcessor:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
             else:
                 logger.error("OpenAI API key not found in config")
-        elif provider_name == "deepseek":
+        elif provider_name in ["deepseek", "custom"]:
             api_base_url = self.ai_config.get("api_base_url")
             timeout = self.ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
@@ -420,7 +420,9 @@ class EmailProcessor:
                     },
                     timeout=timeout,
                 )
-                logger.info(f"DeepSeek client initialized")
+                logger.info(f"{provider_name.title()} client initialized")
+            else:
+                logger.error(f"{provider_name.title()} API key or base URL not found")
 
     async def initialize(self):
         """初期化処理"""
@@ -778,7 +780,7 @@ class EmailProcessor:
                 raw_content = response.choices[0].message.content
                 data = self._extract_json_from_text(raw_content)
 
-            elif provider_name == "deepseek":
+            elif provider_name in ["deepseek", "custom"]:
                 if isinstance(self.ai_client, httpx.AsyncClient):
                     response = await self.ai_client.post(
                         "/v1/chat/completions",
@@ -1152,7 +1154,7 @@ class EmailProcessor:
                 raw_content = response.choices[0].message.content
                 data = self._extract_json_from_text(raw_content)
 
-            elif provider_name == "deepseek":
+            elif provider_name in ["deepseek", "custom"]:
                 if isinstance(self.ai_client, httpx.AsyncClient):
                     response = await self.ai_client.post(
                         "/v1/chat/completions",

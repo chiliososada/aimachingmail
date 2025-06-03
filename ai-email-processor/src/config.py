@@ -50,6 +50,15 @@ class Config:
             "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", 300)),  # 增加token数量
             "timeout": float(os.getenv("DEEPSEEK_TIMEOUT", 120.0)),
         },
+        "custom": {
+            "api_key": os.getenv("CUSTOM_API_KEY"),
+            "api_base_url": os.getenv("CUSTOM_API_BASE_URL"),
+            "model_classify": os.getenv("CUSTOM_MODEL_CLASSIFY", "gpt-3.5-turbo"),
+            "model_extract": os.getenv("CUSTOM_MODEL_EXTRACT", "gpt-4"),
+            "temperature": float(os.getenv("CUSTOM_TEMPERATURE", 0.1)),
+            "max_tokens": int(os.getenv("CUSTOM_MAX_TOKENS", 300)),
+            "timeout": float(os.getenv("CUSTOM_TIMEOUT", 120.0)),
+        },
     }
 
     # 使用するAIプロバイダー
@@ -160,11 +169,13 @@ class Config:
                 errors.append(
                     f"API key for the default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not set."
                 )
-            if (
-                cls.DEFAULT_AI_PROVIDER == "deepseek"
-                and not default_provider_config.get("api_base_url")
-            ):
-                errors.append(f"API base URL for DeepSeek is not set.")
+
+            # 验证需要api_base_url的提供商
+            if cls.DEFAULT_AI_PROVIDER in ["deepseek", "custom"]:
+                if not default_provider_config.get("api_base_url"):
+                    errors.append(
+                        f"API base URL for {cls.DEFAULT_AI_PROVIDER} is not set."
+                    )
 
         # 暗号化キーの確認
         if not cls.ENCRYPTION_KEY:
@@ -222,6 +233,9 @@ class Config:
         print(f"AI Temperature: {ai_config.get('temperature')}")
         print(f"AI Max Tokens: {ai_config.get('max_tokens')}")
         print(f"AI Timeout: {ai_config.get('timeout')}s")
+
+        if ai_config.get("api_base_url"):
+            print(f"AI Base URL: {ai_config.get('api_base_url')}")
 
         classification_config = cls.get_classification_config()
         print(f"\n分类器设置:")

@@ -35,7 +35,7 @@ class EmailClassifier:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
             else:
                 logger.error("OpenAI API key not found")
-        elif provider_name == "deepseek":
+        elif provider_name in ["deepseek", "custom"]:
             api_base_url = ai_config.get("api_base_url")
             timeout = ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
@@ -47,7 +47,9 @@ class EmailClassifier:
                     },
                     timeout=timeout,
                 )
-                logger.info(f"DeepSeek client initialized")
+                logger.info(f"{provider_name.title()} client initialized")
+            else:
+                logger.error(f"{provider_name.title()} API key or base URL not found")
 
         self._init_classification_components()
 
@@ -597,6 +599,171 @@ class EmailClassifier:
 
         except Exception as e:
             logger.error(f"邮件分类过程出错: {e}")
+            return EmailType.UNCLASSIFIED
+
+    async def _call_ai_classifier(
+        self,
+        email_data: Dict,
+        extracted_content: str,
+        sender_analysis: Dict,
+        structure_analysis: Dict,
+    ) -> EmailType:
+        """调用AI进行分类 - 改进版本，支持自定义API"""
+        provider_name = self.ai_config.get("provider_name")
+        model_classify = self.ai_config.get("model_classify", "gpt-3.5-turbo")
+        temperature = self.ai_config.get("temperature", 0.1)
+        max_tokens = self.ai_config.get("max_tokens", 200)
+
+        # 构建更精确的提示词，强调个人技术者介绍的识别
+        prompt = f"""
+あなたは日本のIT業界の専門メール分類システムです。以下のメールを正確に分類してください。
+
+【メール内容】
+件名: {email_data.get('subject', '')}
+送信者: {email_data.get('sender_email', '')}
+本文: {extracted_content[:1500]}
+
+【構造分析情報】
+- 個人情報項目数: {structure_analysis['personal_info_count']}
+- プロジェクト情報項目数: {structure_analysis['project_info_count']}
+- 超強工程師指示符分数: {structure_analysis['ultra_engineer_score']}
+- 超強項目指示符分数: {structure_analysis['ultra_project_score']}
+
+【重要な分類基準】
+1. engineer_related（技術者関連）:
+   ✓ 個人の技術者・エンジニアの紹介メール
+   ✓ 「要員ご紹介」「人材ご紹介」「技術者ご紹介」の表現
+   ✓ 【氏名】【年齢】【性別】【最寄駅】【実務経験】【単価】【稼働日】などの個人情報
+   ✓ 履歴書・職務経歴書の送付や添付
+   ✓ 個人のスキル、経験、人柄の紹介
+
+2. project_related（案件関連）:
+   ✓ IT案件・プロジェクトの募集
+   ✓ 開発案件の詳細説明
+   ✓ 【案件名】【必須スキル】【歓迎スキル】【勤務地】【期間】などの案件情報
+   ✓ 参画者募集、応募締切の記載
+
+3. other: 業界関連の重要メール（勉強会、サービス紹介等）
+4. unclassified: 無関係またはspam
+
+【特別注意事項】
+- 「要員ご紹介」「人材ご紹介」は100%engineer_relatedです
+- 【氏名】【年齢】などの個人情報フォーマットはengineer_relatedの強い指標です
+- 技術スキルが記載されていても、個人の紹介文脈ならengineer_relatedです
+- 募集文脈でなく紹介文脈かを重視してください
+
+【出力形式】
+{{"category": "カテゴリー名", "confidence": 0.0-1.0, "reasoning": "判定理由"}}
+
+JSONのみで回答してください。
+"""
+
+        messages = [
+            {
+                "role": "system",
+                "content": "あなたは高精度なメール分類の専門家です。個人の技術者紹介は必ずengineer_relatedに分類してください。「要員ご紹介」は100%engineer_relatedです。",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            if provider_name == "openai":
+                response = await self.ai_client.chat.completions.create(
+                    model=model_classify,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = response.choices[0].message.content.strip()
+
+            elif provider_name in ["deepseek", "custom"]:
+                response = await self.ai_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": model_classify,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"].strip()
+            else:
+                raise ValueError(f"Unsupported AI provider: {provider_name}")
+
+            # 解析AI响应
+            try:
+                json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    result = json.loads(content)
+
+                category_str = result.get("category", "unclassified")
+                confidence = float(result.get("confidence", 0.5))
+                reasoning = result.get("reasoning", "AI分析结果")
+
+                logger.info(f"AI分类结果: {category_str}, 置信度: {confidence:.2f}")
+                logger.info(f"AI推理: {reasoning}")
+
+                if "engineer" in category_str:
+                    return EmailType.ENGINEER_RELATED
+                elif "project" in category_str:
+                    return EmailType.PROJECT_RELATED
+                elif "other" in category_str:
+                    return EmailType.OTHER
+                else:
+                    return EmailType.UNCLASSIFIED
+
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"AI响应解析失败: {e}, 内容: {content}")
+                return self._extract_category_from_text(content)
+
+        except Exception as e:
+            logger.error(f"AI分类调用失败: {e}")
+            return EmailType.UNCLASSIFIED
+
+    def _extract_category_from_text(self, text: str) -> EmailType:
+        """从文本中提取分类信息（AI返回非JSON时的备用方法）"""
+        text_lower = text.lower()
+
+        if "engineer" in text_lower:
+            return EmailType.ENGINEER_RELATED
+        elif "project" in text_lower:
+            return EmailType.PROJECT_RELATED
+        elif "other" in text_lower:
+            return EmailType.OTHER
+        else:
+            return EmailType.UNCLASSIFIED
+
+    def _fallback_classification(
+        self,
+        content: str,
+        project_score: float,
+        engineer_score: float,
+        project_keywords: List[str],
+        engineer_keywords: List[str],
+    ) -> EmailType:
+        """备用分类逻辑 - 改进版本"""
+        logger.info(
+            f"使用备用分类逻辑 - 项目得分: {project_score:.1f}, 工程师得分: {engineer_score:.1f}"
+        )
+
+        # 提高判断阈值，避免误分类
+        if engineer_score > project_score and engineer_score > 3.0:
+            logger.info(f"备用分类: engineer_related, 关键词: {engineer_keywords[:3]}")
+            return EmailType.ENGINEER_RELATED
+        elif project_score > engineer_score and project_score > 3.0:
+            logger.info(f"备用分类: project_related, 关键词: {project_keywords[:3]}")
+            return EmailType.PROJECT_RELATED
+        elif any(
+            word in content.lower() for word in ["説明会", "案内", "勉強会", "セミナー"]
+        ):
+            logger.info("备用分类: other")
+            return EmailType.OTHER
+        else:
+            logger.info("备用分类: unclassified")
             return EmailType.UNCLASSIFIED
 
     async def _call_ai_classifier(
