@@ -635,93 +635,133 @@ class EmailProcessor:
 
         return emails
 
-    async def _parse_email(self, msg) -> Dict:
-        """メールメッセージをパース"""
-        # 件名のデコード
-        subject = ""
-        if msg["Subject"]:
-            subject, encoding = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes):
-                subject = subject.decode(encoding or "utf-8")
 
-        # 送信者情報
-        sender = msg.get("From", "")
-        sender_name = ""
-        sender_email = ""
+async def _parse_email(self, msg) -> Dict:
+    """メールメッセージをパース"""
+    # 件名のデコード
+    subject = ""
+    if msg["Subject"]:
+        subject, encoding = decode_header(msg["Subject"])[0]
+        if isinstance(subject, bytes):
+            subject = subject.decode(encoding or "utf-8")
 
-        if "<" in sender and ">" in sender:
-            sender_name = sender.split("<")[0].strip()
-            sender_email = sender.split("<")[1].replace(">", "").strip()
-        else:
-            sender_email = sender
+    # 送信者情報
+    sender = msg.get("From", "")
+    sender_name = ""
+    sender_email = ""
 
-        # 本文の抽出
-        body_text = ""
-        body_html = ""
-        attachments = []
+    if "<" in sender and ">" in sender:
+        sender_name = sender.split("<")[0].strip()
+        sender_email = sender.split("<")[1].replace(">", "").strip()
+    else:
+        sender_email = sender
 
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition", ""))
+    # 本文の抽出
+    body_text = ""
+    body_html = ""
+    attachments = []
 
-            if "attachment" in content_disposition:
-                # 添付ファイル処理
-                filename = part.get_filename()
-                if filename:
-                    try:
-                        # 添付ファイルの内容を取得
-                        file_content = part.get_payload(decode=True)
-                        attachment_data = {
-                            "filename": filename,
-                            "content_type": content_type,
-                            "size": len(file_content) if file_content else 0,
-                            "content": file_content,  # バイナリ内容を保存
-                        }
-                        attachments.append(attachment_data)
-                        logger.info(
-                            f"添付ファイル取得: {filename} ({len(file_content)} bytes)"
-                        )
-                    except Exception as e:
-                        logger.error(f"添付ファイル処理エラー {filename}: {e}")
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        content_disposition = str(part.get("Content-Disposition", ""))
 
-            elif content_type == "text/plain":
-                body_text = part.get_payload(decode=True).decode(
-                    "utf-8", errors="ignore"
-                )
-            elif content_type == "text/html":
-                body_html = part.get_payload(decode=True).decode(
-                    "utf-8", errors="ignore"
-                )
+        if "attachment" in content_disposition:
+            # 添付ファイル処理
+            filename = part.get_filename()
+            if filename:
+                try:
+                    # 🔧 修复：正确解码文件名
+                    decoded_filename = ""
+                    if filename:
+                        # 解码可能编码的文件名
+                        try:
+                            decoded_parts = decode_header(filename)
+                            for part_content, part_encoding in decoded_parts:
+                                if isinstance(part_content, bytes):
+                                    if part_encoding:
+                                        decoded_filename += part_content.decode(
+                                            part_encoding
+                                        )
+                                    else:
+                                        # 尝试常见编码
+                                        for encoding in [
+                                            "utf-8",
+                                            "gbk",
+                                            "shift_jis",
+                                            "iso-2022-jp",
+                                        ]:
+                                            try:
+                                                decoded_filename += part_content.decode(
+                                                    encoding
+                                                )
+                                                break
+                                            except UnicodeDecodeError:
+                                                continue
+                                        else:
+                                            # 如果所有编码都失败，使用errors='replace'
+                                            decoded_filename += part_content.decode(
+                                                "utf-8", errors="replace"
+                                            )
+                                else:
+                                    decoded_filename += str(part_content)
+                        except Exception as decode_error:
+                            logger.warning(
+                                f"文件名解码失败: {filename}, 错误: {decode_error}"
+                            )
+                            decoded_filename = filename  # 使用原始文件名作为后备
 
-        return {
-            "subject": subject,
-            "sender_name": sender_name,
-            "sender_email": sender_email,
-            "body_text": body_text,
-            "body_html": body_html,
-            "attachments": attachments,
-            "received_at": datetime.now(),
-        }
+                    # 添付ファイルの内容を取得
+                    file_content = part.get_payload(decode=True)
+                    attachment_data = {
+                        "filename": decoded_filename,  # 🔧 使用解码后的文件名
+                        "original_filename": filename,  # 保留原始文件名用于调试
+                        "content_type": content_type,
+                        "size": len(file_content) if file_content else 0,
+                        "content": file_content,  # バイナリ内容を保存
+                    }
+                    attachments.append(attachment_data)
 
-    async def extract_project_info(
-        self, email_data: Dict
-    ) -> Optional[ProjectStructured]:
-        """メールから案件情報を抽出して構造化"""
-        if not self.ai_client:
-            logger.warning(
-                "AI client not initialized. Skipping project info extraction."
-            )
-            return None
+                    # 🔧 改进日志，显示解码前后的文件名
+                    logger.info(
+                        f"添付ファイル取得: {decoded_filename} "
+                        f"(原始: {filename if filename != decoded_filename else '同じ'}) "
+                        f"({len(file_content)} bytes)"
+                    )
 
-        provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get("model_extract", "gpt-4")
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+                except Exception as e:
+                    logger.error(f"添付ファイル処理エラー {filename}: {e}")
 
-        # 使用分类器的智能内容提取
-        extracted_content = self.classifier.smart_content_extraction(email_data)
+        elif content_type == "text/plain":
+            body_text = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+        elif content_type == "text/html":
+            body_html = part.get_payload(decode=True).decode("utf-8", errors="ignore")
 
-        prompt = f"""
+    return {
+        "subject": subject,
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "body_text": body_text,
+        "body_html": body_html,
+        "attachments": attachments,
+        "received_at": datetime.now(),
+    }
+
+
+async def extract_project_info(self, email_data: Dict) -> Optional[ProjectStructured]:
+    """メールから案件情報を抽出して構造化"""
+    if not self.ai_client:
+        logger.warning("AI client not initialized. Skipping project info extraction.")
+        return None
+
+    provider_name = self.ai_config.get("provider_name")
+    model_extract = self.ai_config.get("model_extract", "gpt-4")
+    temperature = self.ai_config.get("temperature", 0.3)
+    max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+
+    # 使用分类器的智能内容提取
+    extracted_content = self.classifier.smart_content_extraction(email_data)
+
+    prompt = f"""
         以下のメールから案件情報を抽出して、必ずJSON形式で返してください。他の説明は不要です。
 
         件名: {email_data['subject']}
@@ -761,88 +801,87 @@ class EmailProcessor:
         - JSONのみを返してください
         """
 
-        messages = [
-            {
-                "role": "system",
-                "content": "あなたは案件情報抽出の専門家です。必ずJSONのみを返してください。",
-            },
-            {"role": "user", "content": prompt},
-        ]
+    messages = [
+        {
+            "role": "system",
+            "content": "あなたは案件情報抽出の専門家です。必ずJSONのみを返してください。",
+        },
+        {"role": "user", "content": prompt},
+    ]
 
-        try:
-            if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
-                    model=model_extract,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens_extract,
+    try:
+        if provider_name == "openai":
+            response = await self.ai_client.chat.completions.create(
+                model=model_extract,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens_extract,
+            )
+            raw_content = response.choices[0].message.content
+            data = self._extract_json_from_text(raw_content)
+
+        elif provider_name in ["deepseek", "custom"]:
+            if isinstance(self.ai_client, httpx.AsyncClient):
+                response = await self.ai_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": model_extract,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens_extract,
+                    },
                 )
-                raw_content = response.choices[0].message.content
-                data = self._extract_json_from_text(raw_content)
+                response.raise_for_status()
+                response_json = response.json()
+                raw_response_content = response_json["choices"][0]["message"]["content"]
+                data = self._extract_json_from_text(raw_response_content)
 
-            elif provider_name in ["deepseek", "custom"]:
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    response = await self.ai_client.post(
-                        "/v1/chat/completions",
-                        json={
-                            "model": model_extract,
-                            "messages": messages,
-                            "temperature": temperature,
-                            "max_tokens": max_tokens_extract,
-                        },
-                    )
-                    response.raise_for_status()
-                    response_json = response.json()
-                    raw_response_content = response_json["choices"][0]["message"][
-                        "content"
-                    ]
-                    data = self._extract_json_from_text(raw_response_content)
+        if data:
+            # 处理日期格式，如果没有开始日期，默认为当前日期
+            if not data.get("start_date"):
+                data["start_date"] = datetime.now().strftime("%Y-%m-%d")
+                logger.info("项目开始日期未指定，设置为当前日期（即日）")
+            else:
+                normalized_date = self._parse_date_string(data["start_date"])
+                data["start_date"] = normalized_date or datetime.now().strftime(
+                    "%Y-%m-%d"
+                )
 
-            if data:
-                # 处理日期格式，如果没有开始日期，默认为当前日期
-                if not data.get("start_date"):
-                    data["start_date"] = datetime.now().strftime("%Y-%m-%d")
-                    logger.info("项目开始日期未指定，设置为当前日期（即日）")
-                else:
-                    normalized_date = self._parse_date_string(data["start_date"])
-                    data["start_date"] = normalized_date or datetime.now().strftime(
-                        "%Y-%m-%d"
-                    )
+            # 处理应募截止日期
+            if data.get("application_deadline"):
+                normalized_deadline = self._parse_date_string(
+                    data["application_deadline"]
+                )
+                data["application_deadline"] = normalized_deadline
 
-                # 处理应募截止日期
-                if data.get("application_deadline"):
-                    normalized_deadline = self._parse_date_string(
-                        data["application_deadline"]
-                    )
-                    data["application_deadline"] = normalized_deadline
+            return ProjectStructured(**data)
 
-                return ProjectStructured(**data)
+    except Exception as e:
+        logger.error(f"Error extracting project info: {e}")
+        return None
 
-        except Exception as e:
-            logger.error(f"Error extracting project info: {e}")
-            return None
 
-    async def save_email_to_db(
-        self,
-        tenant_id: str,
-        email_data: Dict,
-        email_type: EmailType,
-        extracted_data: Optional[Dict],
-    ) -> str:
-        """メールをデータベースに保存"""
-        async with self.db_pool.acquire() as conn:
-            # 添付ファイル情報をJSONとして保存（バイナリ内容は除く）
-            attachments_json = []
-            for attachment in email_data.get("attachments", []):
-                attachment_info = {
-                    "filename": attachment.get("filename"),
-                    "content_type": attachment.get("content_type"),
-                    "size": attachment.get("size"),
-                }
-                attachments_json.append(attachment_info)
+async def save_email_to_db(
+    self,
+    tenant_id: str,
+    email_data: Dict,
+    email_type: EmailType,
+    extracted_data: Optional[Dict],
+) -> str:
+    """メールをデータベースに保存"""
+    async with self.db_pool.acquire() as conn:
+        # 添付ファイル情報をJSONとして保存（バイナリ内容は除く）
+        attachments_json = []
+        for attachment in email_data.get("attachments", []):
+            attachment_info = {
+                "filename": attachment.get("filename"),
+                "content_type": attachment.get("content_type"),
+                "size": attachment.get("size"),
+            }
+            attachments_json.append(attachment_info)
 
-            email_id = await conn.fetchval(
-                """
+        email_id = await conn.fetchval(
+            """
                 INSERT INTO receive_emails (
                     tenant_id, subject, body_text, body_html,
                     sender_name, sender_email, email_type,
@@ -851,56 +890,57 @@ class EmailProcessor:
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING id
             """,
-                tenant_id,
-                email_data["subject"],
-                email_data["body_text"],
-                email_data["body_html"],
-                email_data["sender_name"],
-                email_data["sender_email"],
-                email_type.value,
-                ProcessingStatus.PROCESSING.value,
-                json.dumps(extracted_data) if extracted_data else "{}",
-                email_data["received_at"],
-                json.dumps(attachments_json),
-            )
+            tenant_id,
+            email_data["subject"],
+            email_data["body_text"],
+            email_data["body_html"],
+            email_data["sender_name"],
+            email_data["sender_email"],
+            email_type.value,
+            ProcessingStatus.PROCESSING.value,
+            json.dumps(extracted_data) if extracted_data else "{}",
+            email_data["received_at"],
+            json.dumps(attachments_json),
+        )
 
-            return str(email_id)
+        return str(email_id)
 
-    async def save_project(
-        self,
-        tenant_id: str,
-        project_data: ProjectStructured,
-        email_id: str,
-        sender_email: str,
-    ) -> Optional[str]:
-        """案件情報をデータベースに保存"""
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                try:
-                    # 处理开始日期
-                    start_date_value = None
-                    if project_data.start_date:
-                        try:
-                            start_date_value = datetime.strptime(
-                                project_data.start_date, "%Y-%m-%d"
-                            ).date()
-                        except ValueError:
-                            start_date_value = date.today()
-                    else:
+
+async def save_project(
+    self,
+    tenant_id: str,
+    project_data: ProjectStructured,
+    email_id: str,
+    sender_email: str,
+) -> Optional[str]:
+    """案件情報をデータベースに保存"""
+    async with self.db_pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                # 处理开始日期
+                start_date_value = None
+                if project_data.start_date:
+                    try:
+                        start_date_value = datetime.strptime(
+                            project_data.start_date, "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
                         start_date_value = date.today()
+                else:
+                    start_date_value = date.today()
 
-                    # 处理应募截止日期
-                    application_deadline_value = None
-                    if project_data.application_deadline:
-                        try:
-                            application_deadline_value = datetime.strptime(
-                                project_data.application_deadline, "%Y-%m-%d"
-                            ).date()
-                        except ValueError:
-                            pass
+                # 处理应募截止日期
+                application_deadline_value = None
+                if project_data.application_deadline:
+                    try:
+                        application_deadline_value = datetime.strptime(
+                            project_data.application_deadline, "%Y-%m-%d"
+                        ).date()
+                    except ValueError:
+                        pass
 
-                    project_id = await conn.fetchval(
-                        """
+                project_id = await conn.fetchval(
+                    """
                         INSERT INTO projects (
                             tenant_id, title, client_company, partner_company,
                             description, detail_description, skills, key_technologies,
@@ -919,70 +959,71 @@ class EmailProcessor:
                         )
                         RETURNING id
                     """,
-                        tenant_id,
-                        project_data.title,
-                        project_data.client_company,
-                        project_data.partner_company,
-                        project_data.description,
-                        project_data.detail_description,
-                        project_data.skills or [],
-                        project_data.key_technologies,
-                        project_data.location,
-                        project_data.work_type,
-                        start_date_value,
-                        project_data.duration,
-                        application_deadline_value,
-                        project_data.budget,
-                        project_data.desired_budget,
-                        project_data.japanese_level,
-                        project_data.experience,
-                        project_data.foreigner_accepted or False,
-                        project_data.freelancer_accepted or False,
-                        project_data.interview_count or "1",
-                        project_data.processes or [],
-                        project_data.max_candidates or 5,
-                        project_data.manager_name,
-                        project_data.manager_email or sender_email,
-                        datetime.now(),
-                    )
+                    tenant_id,
+                    project_data.title,
+                    project_data.client_company,
+                    project_data.partner_company,
+                    project_data.description,
+                    project_data.detail_description,
+                    project_data.skills or [],
+                    project_data.key_technologies,
+                    project_data.location,
+                    project_data.work_type,
+                    start_date_value,
+                    project_data.duration,
+                    application_deadline_value,
+                    project_data.budget,
+                    project_data.desired_budget,
+                    project_data.japanese_level,
+                    project_data.experience,
+                    project_data.foreigner_accepted or False,
+                    project_data.freelancer_accepted or False,
+                    project_data.interview_count or "1",
+                    project_data.processes or [],
+                    project_data.max_candidates or 5,
+                    project_data.manager_name,
+                    project_data.manager_email or sender_email,
+                    datetime.now(),
+                )
 
-                    await conn.execute(
-                        """
+                await conn.execute(
+                    """
                         UPDATE receive_emails 
                         SET project_id = $1, processing_status = $2, ai_extraction_status = 'completed'
                         WHERE id = $3
                     """,
-                        project_id,
-                        ProcessingStatus.PROCESSED.value,
-                        email_id,
-                    )
+                    project_id,
+                    ProcessingStatus.PROCESSED.value,
+                    email_id,
+                )
 
-                    logger.info(f"Project saved successfully: {project_id}")
-                    return str(project_id)
+                logger.info(f"Project saved successfully: {project_id}")
+                return str(project_id)
 
-                except Exception as e:
-                    logger.error(f"Error saving project: {e}")
-                    await conn.execute(
-                        """
+            except Exception as e:
+                logger.error(f"Error saving project: {e}")
+                await conn.execute(
+                    """
                         UPDATE receive_emails 
                         SET processing_status = $1, ai_extraction_status = 'failed', processing_error = $2
                         WHERE id = $3
                     """,
-                        ProcessingStatus.ERROR.value,
-                        str(e),
-                        email_id,
-                    )
-                    return None
+                    ProcessingStatus.ERROR.value,
+                    str(e),
+                    email_id,
+                )
+                return None
 
-    async def save_engineer_from_resume(
-        self, tenant_id: str, resume_data: ResumeData, email_id: str, sender_email: str
-    ) -> Optional[str]:
-        """简历数据保存为工程师信息"""
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                try:
-                    engineer_id = await conn.fetchval(
-                        """
+
+async def save_engineer_from_resume(
+    self, tenant_id: str, resume_data: ResumeData, email_id: str, sender_email: str
+) -> Optional[str]:
+    """简历数据保存为工程师信息"""
+    async with self.db_pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                engineer_id = await conn.fetchval(
+                    """
                         INSERT INTO engineers (
                             tenant_id, name, email, phone, gender, age,
                             nationality, nearest_station, education,
@@ -1002,65 +1043,64 @@ class EmailProcessor:
                         )
                         RETURNING id
                     """,
-                        tenant_id,
-                        resume_data.name,
-                        resume_data.email or sender_email,
-                        resume_data.phone,
-                        resume_data.gender,
-                        resume_data.age,
-                        resume_data.nationality,
-                        resume_data.nearest_station,
-                        resume_data.education,
-                        resume_data.arrival_year_japan,
-                        resume_data.certifications or [],
-                        resume_data.skills or [],
-                        resume_data.technical_keywords or [],
-                        resume_data.experience,
-                        resume_data.work_scope,
-                        resume_data.work_experience,
-                        resume_data.japanese_level,
-                        resume_data.english_level,
-                        resume_data.availability,
-                        resume_data.preferred_work_style or [],
-                        resume_data.preferred_locations or [],
-                        resume_data.desired_rate_min,
-                        resume_data.desired_rate_max,
-                        resume_data.overtime_available or False,
-                        resume_data.business_trip_available or False,
-                        resume_data.self_promotion,
-                        resume_data.remarks,
-                        resume_data.recommendation,
-                        f"从简历文件提取: {resume_data.source_filename}",
-                        datetime.now(),
-                    )
+                    tenant_id,
+                    resume_data.name,
+                    resume_data.email or sender_email,
+                    resume_data.phone,
+                    resume_data.gender,
+                    resume_data.age,
+                    resume_data.nationality,
+                    resume_data.nearest_station,
+                    resume_data.education,
+                    resume_data.arrival_year_japan,
+                    resume_data.certifications or [],
+                    resume_data.skills or [],
+                    resume_data.technical_keywords or [],
+                    resume_data.experience,
+                    resume_data.work_scope,
+                    resume_data.work_experience,
+                    resume_data.japanese_level,
+                    resume_data.english_level,
+                    resume_data.availability,
+                    resume_data.preferred_work_style or [],
+                    resume_data.preferred_locations or [],
+                    resume_data.desired_rate_min,
+                    resume_data.desired_rate_max,
+                    resume_data.overtime_available or False,
+                    resume_data.business_trip_available or False,
+                    resume_data.self_promotion,
+                    resume_data.remarks,
+                    resume_data.recommendation,
+                    f"从简历文件提取: {resume_data.source_filename}",
+                    datetime.now(),
+                )
 
-                    logger.info(
-                        f"Engineer from resume saved successfully: {engineer_id} ({resume_data.name})"
-                    )
-                    return str(engineer_id)
+                logger.info(
+                    f"Engineer from resume saved successfully: {engineer_id} ({resume_data.name})"
+                )
+                return str(engineer_id)
 
-                except Exception as e:
-                    logger.error(
-                        f"Error saving engineer from resume {resume_data.name}: {e}"
-                    )
-                    return None
+            except Exception as e:
+                logger.error(
+                    f"Error saving engineer from resume {resume_data.name}: {e}"
+                )
+                return None
 
-    async def extract_engineer_info(
-        self, email_data: Dict
-    ) -> Optional[EngineerStructured]:
-        """メールから技術者情報を抽出（邮件本文）- 改进版本，使用标准化提示词"""
-        if not self.ai_client:
-            return None
 
-        provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get("model_extract", "gpt-4")
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+async def extract_engineer_info(self, email_data: Dict) -> Optional[EngineerStructured]:
+    """メールから技術者情報を抽出（邮件本文）- 改进版本，使用标准化提示词"""
+    if not self.ai_client:
+        return None
 
-        extracted_content = self.classifier.smart_content_extraction(email_data)
+    provider_name = self.ai_config.get("provider_name")
+    model_extract = self.ai_config.get("model_extract", "gpt-4")
+    temperature = self.ai_config.get("temperature", 0.3)
+    max_tokens_extract = self.ai_config.get("max_tokens", 2048)
 
-        # 使用改进的提示词，明确数据库约束
-        prompt = f"""
+    extracted_content = self.classifier.smart_content_extraction(email_data)
+
+    # 使用改进的提示词，明确数据库约束
+    prompt = f"""
         以下のメールから技術者情報を抽出して、必ずJSON形式で返してください。
 
         件名: {email_data.get('subject', '')}
@@ -1135,70 +1175,69 @@ class EmailProcessor:
         }}
         """
 
-        messages = [
-            {
-                "role": "system",
-                "content": "あなたは技術者情報抽出の専門家です。データベース制約を厳密に守り、必ずJSONのみを返してください。",
-            },
-            {"role": "user", "content": prompt},
-        ]
+    messages = [
+        {
+            "role": "system",
+            "content": "あなたは技術者情報抽出の専門家です。データベース制約を厳密に守り、必ずJSONのみを返してください。",
+        },
+        {"role": "user", "content": prompt},
+    ]
 
-        try:
-            if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
-                    model=model_extract,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens_extract,
+    try:
+        if provider_name == "openai":
+            response = await self.ai_client.chat.completions.create(
+                model=model_extract,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens_extract,
+            )
+            raw_content = response.choices[0].message.content
+            data = self._extract_json_from_text(raw_content)
+
+        elif provider_name in ["deepseek", "custom"]:
+            if isinstance(self.ai_client, httpx.AsyncClient):
+                response = await self.ai_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": model_extract,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens_extract,
+                    },
                 )
-                raw_content = response.choices[0].message.content
-                data = self._extract_json_from_text(raw_content)
+                response.raise_for_status()
+                response_json = response.json()
+                raw_response_content = response_json["choices"][0]["message"]["content"]
+                data = self._extract_json_from_text(raw_response_content)
 
-            elif provider_name in ["deepseek", "custom"]:
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    response = await self.ai_client.post(
-                        "/v1/chat/completions",
-                        json={
-                            "model": model_extract,
-                            "messages": messages,
-                            "temperature": temperature,
-                            "max_tokens": max_tokens_extract,
-                        },
-                    )
-                    response.raise_for_status()
-                    response_json = response.json()
-                    raw_response_content = response_json["choices"][0]["message"][
-                        "content"
-                    ]
-                    data = self._extract_json_from_text(raw_response_content)
+        if data:
+            logger.info(f"AI提取的原始数据: {data}")
+            # 使用更新的验证器创建EngineerStructured实例
+            engineer_data = EngineerStructured(**data)
+            logger.info(f"成功提取并验证工程师数据: {engineer_data.name}")
+            return engineer_data
 
-            if data:
-                logger.info(f"AI提取的原始数据: {data}")
-                # 使用更新的验证器创建EngineerStructured实例
-                engineer_data = EngineerStructured(**data)
-                logger.info(f"成功提取并验证工程师数据: {engineer_data.name}")
-                return engineer_data
+    except Exception as e:
+        logger.error(f"Error extracting engineer info: {e}")
+        import traceback
 
-        except Exception as e:
-            logger.error(f"Error extracting engineer info: {e}")
-            import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None
 
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
 
-    async def save_engineer(
-        self,
-        tenant_id: str,
-        engineer_data: EngineerStructured,
-        email_id: str,
-        sender_email: str,
-    ) -> Optional[str]:
-        """技術者情報をデータベースに保存（邮件正文提取）"""
-        async with self.db_pool.acquire() as conn:
-            async with conn.transaction():
-                try:
-                    engineer_id = await conn.fetchval(
-                        """
+async def save_engineer(
+    self,
+    tenant_id: str,
+    engineer_data: EngineerStructured,
+    email_id: str,
+    sender_email: str,
+) -> Optional[str]:
+    """技術者情報をデータベースに保存（邮件正文提取）"""
+    async with self.db_pool.acquire() as conn:
+        async with conn.transaction():
+            try:
+                engineer_id = await conn.fetchval(
+                    """
                         INSERT INTO engineers (
                             tenant_id, name, email, phone, gender, age,
                             nationality, nearest_station, education,
@@ -1218,180 +1257,179 @@ class EmailProcessor:
                         )
                         RETURNING id
                     """,
-                        tenant_id,
-                        engineer_data.name,
-                        engineer_data.email or sender_email,
-                        engineer_data.phone,
-                        engineer_data.gender,
-                        engineer_data.age,
-                        engineer_data.nationality,
-                        engineer_data.nearest_station,
-                        engineer_data.education,
-                        engineer_data.arrival_year_japan,
-                        engineer_data.certifications or [],
-                        engineer_data.skills or [],
-                        engineer_data.technical_keywords or [],
-                        engineer_data.experience,
-                        engineer_data.work_scope,
-                        engineer_data.work_experience,
-                        engineer_data.japanese_level,
-                        engineer_data.english_level,
-                        engineer_data.availability,
-                        engineer_data.preferred_work_style or [],
-                        engineer_data.preferred_locations or [],
-                        engineer_data.desired_rate_min,
-                        engineer_data.desired_rate_max,
-                        engineer_data.overtime_available or False,
-                        engineer_data.business_trip_available or False,
-                        engineer_data.self_promotion,
-                        engineer_data.remarks,
-                        engineer_data.recommendation,
-                        engineer_data.current_status or "提案中",
-                        datetime.now(),
-                    )
+                    tenant_id,
+                    engineer_data.name,
+                    engineer_data.email or sender_email,
+                    engineer_data.phone,
+                    engineer_data.gender,
+                    engineer_data.age,
+                    engineer_data.nationality,
+                    engineer_data.nearest_station,
+                    engineer_data.education,
+                    engineer_data.arrival_year_japan,
+                    engineer_data.certifications or [],
+                    engineer_data.skills or [],
+                    engineer_data.technical_keywords or [],
+                    engineer_data.experience,
+                    engineer_data.work_scope,
+                    engineer_data.work_experience,
+                    engineer_data.japanese_level,
+                    engineer_data.english_level,
+                    engineer_data.availability,
+                    engineer_data.preferred_work_style or [],
+                    engineer_data.preferred_locations or [],
+                    engineer_data.desired_rate_min,
+                    engineer_data.desired_rate_max,
+                    engineer_data.overtime_available or False,
+                    engineer_data.business_trip_available or False,
+                    engineer_data.self_promotion,
+                    engineer_data.remarks,
+                    engineer_data.recommendation,
+                    engineer_data.current_status or "提案中",
+                    datetime.now(),
+                )
 
-                    await conn.execute(
-                        """
+                await conn.execute(
+                    """
                         UPDATE receive_emails 
                         SET engineer_id = $1, processing_status = $2, ai_extraction_status = 'completed'
                         WHERE id = $3
                     """,
-                        engineer_id,
-                        ProcessingStatus.PROCESSED.value,
-                        email_id,
-                    )
+                    engineer_id,
+                    ProcessingStatus.PROCESSED.value,
+                    email_id,
+                )
 
-                    logger.info(
-                        f"Engineer saved successfully: {engineer_id} ({engineer_data.name})"
-                    )
-                    return str(engineer_id)
+                logger.info(
+                    f"Engineer saved successfully: {engineer_id} ({engineer_data.name})"
+                )
+                return str(engineer_id)
 
-                except Exception as e:
-                    logger.error(f"Error saving engineer: {e}")
-                    await conn.execute(
-                        """
+            except Exception as e:
+                logger.error(f"Error saving engineer: {e}")
+                await conn.execute(
+                    """
                         UPDATE receive_emails 
                         SET processing_status = $1, ai_extraction_status = 'failed', processing_error = $2
                         WHERE id = $3
                     """,
-                        ProcessingStatus.ERROR.value,
-                        str(e),
-                        email_id,
+                    ProcessingStatus.ERROR.value,
+                    str(e),
+                    email_id,
+                )
+                return None
+
+
+async def process_emails_for_tenant(self, tenant_id: str):
+    """特定テナントのメール処理を実行"""
+    settings_list = await self.get_smtp_settings(tenant_id)
+
+    if not settings_list:
+        logger.warning(f"No SMTP settings found for tenant: {tenant_id}")
+        return
+
+    for settings in settings_list:
+        try:
+            emails = await self.fetch_emails(settings)
+            logger.info(f"Fetched {len(emails)} new emails for tenant {tenant_id}")
+
+            for email_data in emails:
+                # 使用分类器进行邮件分类
+                email_type = await self.classifier.classify_email(email_data)
+                logger.info(f"Email classified as: {email_type.value}")
+
+                email_id = await self.save_email_to_db(
+                    tenant_id, email_data, email_type, None
+                )
+
+                if email_type == EmailType.PROJECT_RELATED:
+                    project_data = await self.extract_project_info(email_data)
+                    if project_data:
+                        await self.save_project(
+                            tenant_id,
+                            project_data,
+                            email_id,
+                            email_data["sender_email"],
+                        )
+
+                elif email_type == EmailType.ENGINEER_RELATED:
+                    # 检查是否有简历附件
+                    attachments = email_data.get("attachments", [])
+                    has_resume_attachments = (
+                        self.attachment_processor.has_resume_attachments(attachments)
                     )
-                    return None
 
-    async def process_emails_for_tenant(self, tenant_id: str):
-        """特定テナントのメール処理を実行"""
-        settings_list = await self.get_smtp_settings(tenant_id)
-
-        if not settings_list:
-            logger.warning(f"No SMTP settings found for tenant: {tenant_id}")
-            return
-
-        for settings in settings_list:
-            try:
-                emails = await self.fetch_emails(settings)
-                logger.info(f"Fetched {len(emails)} new emails for tenant {tenant_id}")
-
-                for email_data in emails:
-                    # 使用分类器进行邮件分类
-                    email_type = await self.classifier.classify_email(email_data)
-                    logger.info(f"Email classified as: {email_type.value}")
-
-                    email_id = await self.save_email_to_db(
-                        tenant_id, email_data, email_type, None
-                    )
-
-                    if email_type == EmailType.PROJECT_RELATED:
-                        project_data = await self.extract_project_info(email_data)
-                        if project_data:
-                            await self.save_project(
-                                tenant_id,
-                                project_data,
-                                email_id,
-                                email_data["sender_email"],
-                            )
-
-                    elif email_type == EmailType.ENGINEER_RELATED:
-                        # 检查是否有简历附件
-                        attachments = email_data.get("attachments", [])
-                        has_resume_attachments = (
-                            self.attachment_processor.has_resume_attachments(
+                    if has_resume_attachments:
+                        logger.info(f"发现简历附件，开始处理...")
+                        # 处理简历附件
+                        resume_data_list = (
+                            await self.attachment_processor.process_resume_attachments(
                                 attachments
                             )
                         )
 
-                        if has_resume_attachments:
-                            logger.info(f"发现简历附件，开始处理...")
-                            # 处理简历附件
-                            resume_data_list = await self.attachment_processor.process_resume_attachments(
-                                attachments
-                            )
+                        if resume_data_list:
+                            logger.info(f"成功提取 {len(resume_data_list)} 份简历数据")
+                            engineer_ids = []
 
-                            if resume_data_list:
-                                logger.info(
-                                    f"成功提取 {len(resume_data_list)} 份简历数据"
+                            # 保存每个简历数据
+                            for resume_data in resume_data_list:
+                                engineer_id = await self.save_engineer_from_resume(
+                                    tenant_id,
+                                    resume_data,
+                                    email_id,
+                                    email_data["sender_email"],
                                 )
-                                engineer_ids = []
+                                if engineer_id:
+                                    engineer_ids.append(engineer_id)
 
-                                # 保存每个简历数据
-                                for resume_data in resume_data_list:
-                                    engineer_id = await self.save_engineer_from_resume(
-                                        tenant_id,
-                                        resume_data,
-                                        email_id,
-                                        email_data["sender_email"],
-                                    )
-                                    if engineer_id:
-                                        engineer_ids.append(engineer_id)
-
-                                # 更新邮件状态
-                                if engineer_ids:
-                                    async with self.db_pool.acquire() as conn:
-                                        await conn.execute(
-                                            """
+                            # 更新邮件状态
+                            if engineer_ids:
+                                async with self.db_pool.acquire() as conn:
+                                    await conn.execute(
+                                        """
                                             UPDATE receive_emails 
                                             SET engineer_id = $1, processing_status = $2, ai_extraction_status = 'completed'
                                             WHERE id = $3
                                         """,
-                                            engineer_ids[0],  # 使用第一个工程师ID
-                                            ProcessingStatus.PROCESSED.value,
-                                            email_id,
-                                        )
+                                        engineer_ids[0],  # 使用第一个工程师ID
+                                        ProcessingStatus.PROCESSED.value,
+                                        email_id,
+                                    )
 
-                                logger.info(
-                                    f"保存了 {len(engineer_ids)} 个工程师记录从简历附件"
-                                )
-                                continue
-                            else:
-                                logger.warning("简历附件处理失败，尝试从邮件正文提取")
-
-                        # 如果没有简历附件或处理失败，从邮件正文提取
-                        engineer_data = await self.extract_engineer_info(email_data)
-                        if engineer_data:
-                            await self.save_engineer(
-                                tenant_id,
-                                engineer_data,
-                                email_id,
-                                email_data["sender_email"],
+                            logger.info(
+                                f"保存了 {len(engineer_ids)} 个工程师记录从简历附件"
                             )
+                            continue
+                        else:
+                            logger.warning("简历附件处理失败，尝试从邮件正文提取")
 
-                    else:
-                        # OTHER或UNCLASSIFIED类型的邮件，只标记为已处理
-                        async with self.db_pool.acquire() as conn:
-                            await conn.execute(
-                                """
+                    # 如果没有简历附件或处理失败，从邮件正文提取
+                    engineer_data = await self.extract_engineer_info(email_data)
+                    if engineer_data:
+                        await self.save_engineer(
+                            tenant_id,
+                            engineer_data,
+                            email_id,
+                            email_data["sender_email"],
+                        )
+
+                else:
+                    # OTHER或UNCLASSIFIED类型的邮件，只标记为已处理
+                    async with self.db_pool.acquire() as conn:
+                        await conn.execute(
+                            """
                                 UPDATE receive_emails 
                                 SET processing_status = $1
                                 WHERE id = $2
                             """,
-                                ProcessingStatus.PROCESSED.value,
-                                email_id,
-                            )
+                            ProcessingStatus.PROCESSED.value,
+                            email_id,
+                        )
 
-            except Exception as e:
-                logger.error(f"Error processing emails for settings {settings.id}: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"Error processing emails for settings {settings.id}: {e}")
+            continue
 
 
 # バッチ処理用のメイン関数

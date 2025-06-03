@@ -181,132 +181,160 @@ class AttachmentProcessor:
             logger.error(f"PDF文档解析失败: {e}")
             return ""
 
-    def extract_text_from_excel(self, file_content: bytes) -> str:
-        """从Excel文件提取文本"""
-        if not EXCEL_AVAILABLE:
-            logger.error("openpyxl not available for Excel document processing")
-            return ""
 
+def extract_text_from_excel(self, file_content: bytes) -> str:
+    """从Excel文件提取文本"""
+    if not EXCEL_AVAILABLE:
+        logger.error("❌ openpyxl not available for Excel document processing")
+        return ""
+
+    try:
+        logger.info("🔧 开始解析Excel文件...")
+        workbook = openpyxl.load_workbook(io.BytesIO(file_content))
+        full_text = []
+
+        logger.info(
+            f"📊 Excel工作簿包含 {len(workbook.sheetnames)} 个工作表: {workbook.sheetnames}"
+        )
+
+        for sheet_name in workbook.sheetnames:
+            logger.info(f"📄 正在处理工作表: {sheet_name}")
+            sheet = workbook[sheet_name]
+            sheet_text = []
+
+            for row_num, row in enumerate(sheet.iter_rows(values_only=True), 1):
+                row_text = []
+                for cell in row:
+                    if cell is not None and str(cell).strip():
+                        row_text.append(str(cell).strip())
+                if row_text:
+                    sheet_text.append(" | ".join(row_text))
+
+            if sheet_text:
+                full_text.append(f"=== {sheet_name} ===")
+                full_text.extend(sheet_text)
+                logger.info(f"✅ 从工作表 {sheet_name} 提取了 {len(sheet_text)} 行数据")
+
+        text = "\n".join(full_text)
+
+        # 🔧 确保控制台输出
+        print(f"\n{'='*60}")
+        print(f"📊 Excel文件解析结果:")
+        print(f"{'='*60}")
+        print(text)
+        print(f"{'='*60}\n")
+
+        logger.info(f"✅ 从Excel文档提取了 {len(text)} 字符的文本")
+        return text
+
+    except Exception as e:
+        logger.error(f"❌ Excel文档解析失败: {e}")
+        import traceback
+
+        logger.error(f"详细错误: {traceback.format_exc()}")
+        return ""
+
+
+def extract_text_from_attachment(self, attachment: Dict) -> str:
+    """根据附件类型提取文本内容"""
+    filename = attachment.get("filename", "").lower()
+    original_filename = attachment.get("original_filename", "")
+    file_content = attachment.get("content", b"")
+
+    logger.info(f"🔧 准备从附件提取文本: {filename}")
+    logger.info(f"   原始文件名: {original_filename}")
+    logger.info(f"   文件大小: {len(file_content)} 字节")
+
+    if not file_content:
+        logger.warning(f"⚠️ 附件 {filename} 没有内容")
+        return ""
+
+    # 如果内容是base64编码的字符串，先解码
+    if isinstance(file_content, str):
         try:
-            workbook = openpyxl.load_workbook(io.BytesIO(file_content))
-            full_text = []
-
-            for sheet_name in workbook.sheetnames:
-                sheet = workbook[sheet_name]
-                sheet_text = []
-
-                for row in sheet.iter_rows(values_only=True):
-                    row_text = []
-                    for cell in row:
-                        if cell is not None and str(cell).strip():
-                            row_text.append(str(cell).strip())
-                    if row_text:
-                        sheet_text.append(" | ".join(row_text))
-
-                if sheet_text:
-                    full_text.append(f"=== {sheet_name} ===")
-                    full_text.extend(sheet_text)
-
-            text = "\n".join(full_text)
-            print(text)  # 👈 控制台输出内容
-            logger.info(f"从Excel文档提取了 {len(text)} 字符的文本")
-            return text
-
+            file_content = base64.b64decode(file_content)
+            logger.info(f"✅ Base64解码成功")
         except Exception as e:
-            logger.error(f"Excel文档解析失败: {e}")
+            logger.error(f"❌ Base64解码失败: {e}")
             return ""
 
-    def extract_text_from_attachment(self, attachment: Dict) -> str:
-        """根据附件类型提取文本内容"""
-        filename = attachment.get("filename", "").lower()
-        file_content = attachment.get("content", b"")
+    # 根据文件扩展名选择解析方法
+    if filename.endswith((".docx", ".doc")):
+        logger.info(f"📄 识别为Word文档，调用Word解析器")
+        return self.extract_text_from_docx(file_content)
+    elif filename.endswith(".pdf"):
+        logger.info(f"📄 识别为PDF文档，调用PDF解析器")
+        return self.extract_text_from_pdf(file_content)
+    elif filename.endswith((".xlsx", ".xls")):
+        logger.info(f"📊 识别为Excel文档，调用Excel解析器")
+        return self.extract_text_from_excel(file_content)
+    else:
+        logger.warning(f"❓ 不支持的文件类型: {filename}")
+        return ""
 
-        if not file_content:
-            logger.warning(f"附件 {filename} 没有内容")
-            return ""
 
-        # 如果内容是base64编码的字符串，先解码
-        if isinstance(file_content, str):
+def _extract_json_from_text(self, text: str) -> Optional[Dict]:
+    """从AI响应文本中提取JSON"""
+    try:
+        # 尝试直接解析
+        result = json.loads(text.strip())
+        return result
+    except json.JSONDecodeError:
+        # 尝试查找JSON块
+        json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+        matches = re.findall(json_pattern, text, re.DOTALL)
+
+        for match in matches:
             try:
-                file_content = base64.b64decode(file_content)
-            except Exception as e:
-                logger.error(f"Base64解码失败: {e}")
-                return ""
+                result = json.loads(match)
+                return result
+            except json.JSONDecodeError:
+                continue
 
-        # 根据文件扩展名选择解析方法
-        if filename.endswith((".docx", ".doc")):
-            return self.extract_text_from_docx(file_content)
-        elif filename.endswith(".pdf"):
-            return self.extract_text_from_pdf(file_content)
-        elif filename.endswith((".xlsx", ".xls")):
-            return self.extract_text_from_excel(file_content)
-        else:
-            logger.warning(f"不支持的文件类型: {filename}")
-            return ""
+        # 尝试复杂的JSON提取
+        start_idx = text.find("{")
+        if start_idx != -1:
+            brace_count = 0
+            for i, char in enumerate(text[start_idx:], start_idx):
+                if char == "{":
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0:
+                        try:
+                            extracted = text[start_idx : i + 1]
+                            result = json.loads(extracted)
+                            return result
+                        except json.JSONDecodeError:
+                            break
 
-    def _extract_json_from_text(self, text: str) -> Optional[Dict]:
-        """从AI响应文本中提取JSON"""
-        try:
-            # 尝试直接解析
-            result = json.loads(text.strip())
-            return result
-        except json.JSONDecodeError:
-            # 尝试查找JSON块
-            json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
-            matches = re.findall(json_pattern, text, re.DOTALL)
+        logger.warning(f"无法从文本中提取JSON: {text[:200]}...")
+        return None
 
-            for match in matches:
-                try:
-                    result = json.loads(match)
-                    return result
-                except json.JSONDecodeError:
-                    continue
 
-            # 尝试复杂的JSON提取
-            start_idx = text.find("{")
-            if start_idx != -1:
-                brace_count = 0
-                for i, char in enumerate(text[start_idx:], start_idx):
-                    if char == "{":
-                        brace_count += 1
-                    elif char == "}":
-                        brace_count -= 1
-                        if brace_count == 0:
-                            try:
-                                extracted = text[start_idx : i + 1]
-                                result = json.loads(extracted)
-                                return result
-                            except json.JSONDecodeError:
-                                break
+async def extract_resume_data_with_ai(
+    self, resume_text: str, filename: str = ""
+) -> Optional[ResumeData]:
+    """使用AI从简历文本中提取结构化数据"""
+    logger.warning(f"resume_text: {resume_text}...")
+    if not self.ai_client:
+        logger.warning("AI client not initialized. Skipping resume data extraction.")
+        return None
 
-            logger.warning(f"无法从文本中提取JSON: {text[:200]}...")
-            return None
+    if not resume_text.strip():
+        logger.warning("简历文本为空，跳过提取")
+        return None
 
-    async def extract_resume_data_with_ai(
-        self, resume_text: str, filename: str = ""
-    ) -> Optional[ResumeData]:
-        """使用AI从简历文本中提取结构化数据"""
-        logger.warning(f"resume_text: {resume_text}...")
-        if not self.ai_client:
-            logger.warning(
-                "AI client not initialized. Skipping resume data extraction."
-            )
-            return None
+    provider_name = self.ai_config.get("provider_name")
+    model_extract = self.ai_config.get("model_extract", "gpt-4")
+    temperature = self.ai_config.get("temperature", 0.3)
+    max_tokens_extract = self.ai_config.get("max_tokens", 2048)
 
-        if not resume_text.strip():
-            logger.warning("简历文本为空，跳过提取")
-            return None
+    # 限制文本长度，避免超出AI模型限制
+    if len(resume_text) > 4000:
+        resume_text = resume_text[:4000] + "..."
 
-        provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get("model_extract", "gpt-4")
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
-
-        # 限制文本长度，避免超出AI模型限制
-        if len(resume_text) > 4000:
-            resume_text = resume_text[:4000] + "..."
-
-        prompt = f"""
+    prompt = f"""
 以下は履歴書・職務経歴書の内容です。この情報から技術者の詳細情報を抽出して、必ずJSON形式で返してください。
 
 【ファイル名】: {filename}
@@ -354,205 +382,231 @@ class AttachmentProcessor:
 6. JSONのみを返してください、他の説明は不要です
 """
 
-        messages = [
-            {
-                "role": "system",
-                "content": "あなたは履歴書・職務経歴書から情報を抽出する専門家です。必ずJSONのみを返してください。",
-            },
-            {"role": "user", "content": prompt},
-        ]
+    messages = [
+        {
+            "role": "system",
+            "content": "あなたは履歴書・職務経歴書から情報を抽出する専門家です。必ずJSONのみを返してください。",
+        },
+        {"role": "user", "content": prompt},
+    ]
 
-        try:
-            if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
-                    model=model_extract,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens_extract,
-                )
-                raw_content = response.choices[0].message.content
-                data = self._extract_json_from_text(raw_content)
+    try:
+        if provider_name == "openai":
+            response = await self.ai_client.chat.completions.create(
+                model=model_extract,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens_extract,
+            )
+            raw_content = response.choices[0].message.content
+            data = self._extract_json_from_text(raw_content)
 
-            elif provider_name in ["deepseek", "custom"]:
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    try:
-                        logger.info(
-                            f"发送简历解析请求到{provider_name.title()} API: {filename}"
-                        )
+        elif provider_name in ["deepseek", "custom"]:
+            if isinstance(self.ai_client, httpx.AsyncClient):
+                try:
+                    logger.info(
+                        f"发送简历解析请求到{provider_name.title()} API: {filename}"
+                    )
 
-                        response = await self.ai_client.post(
-                            "/v1/chat/completions",
-                            json={
-                                "model": model_extract,
-                                "messages": messages,
-                                "temperature": temperature,
-                                "max_tokens": max_tokens_extract,
-                            },
-                        )
-                        response.raise_for_status()
+                    response = await self.ai_client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": model_extract,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens_extract,
+                        },
+                    )
+                    response.raise_for_status()
 
-                        response_json = response.json()
-                        raw_response_content = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                    response_json = response.json()
+                    raw_response_content = response_json["choices"][0]["message"][
+                        "content"
+                    ]
 
-                        logger.info(
-                            f"=== {provider_name.title()} 简历解析响应 ({filename}) ==="
-                        )
-                        logger.info(f"Raw content:\n{raw_response_content}")
+                    logger.info(
+                        f"=== {provider_name.title()} 简历解析响应 ({filename}) ==="
+                    )
+                    logger.info(f"Raw content:\n{raw_response_content}")
 
-                        data = self._extract_json_from_text(raw_response_content)
-                        if data:
-                            logger.info(f"成功解析简历JSON: {filename}")
-                        else:
-                            logger.error(f"JSON解析失败: {filename}")
+                    data = self._extract_json_from_text(raw_response_content)
+                    if data:
+                        logger.info(f"成功解析简历JSON: {filename}")
+                    else:
+                        logger.error(f"JSON解析失败: {filename}")
 
-                    except Exception as e:
-                        logger.error(
-                            f"{provider_name.title()} API error for resume {filename}: {e}"
-                        )
-                        return None
-                else:
-                    logger.warning(
-                        f"{provider_name.title()} client not available for resume extraction"
+                except Exception as e:
+                    logger.error(
+                        f"{provider_name.title()} API error for resume {filename}: {e}"
                     )
                     return None
             else:
                 logger.warning(
-                    f"Unsupported AI provider for resume extraction: {provider_name}"
+                    f"{provider_name.title()} client not available for resume extraction"
                 )
                 return None
-
-            if data:
-                # 确保name字段存在
-                if not data.get("name"):
-                    data["name"] = "名前不明"
-
-                # 确保experience字段存在
-                if not data.get("experience"):
-                    data["experience"] = "不明"
-
-                return ResumeData(**data)
-            else:
-                logger.error(
-                    f"Failed to parse JSON from AI response for resume: {filename}"
-                )
-                return None
-
-        except Exception as e:
-            logger.error(f"Error extracting resume data from {filename}: {e}")
-            import traceback
-
-            logger.error(f"Full traceback: {traceback.format_exc()}")
+        else:
+            logger.warning(
+                f"Unsupported AI provider for resume extraction: {provider_name}"
+            )
             return None
 
-    async def process_resume_attachments(
-        self, attachments: List[Dict]
-    ) -> List[ResumeData]:
-        """处理所有简历附件，返回提取的简历数据列表"""
-        resume_data_list = []
+        if data:
+            # 确保name字段存在
+            if not data.get("name"):
+                data["name"] = "名前不明"
 
-        # 过滤出可能的简历文件
-        resume_files = []
-        resume_extensions = [".docx", ".doc", ".pdf", ".xlsx", ".xls"]
-        engineer_patterns = [
-            r"履歴書",
-            r"職務経歴",
-            r"スキルシート",
-            r"resume",
-            r"cv",
-            r"profile",
-        ]
+            # 确保experience字段存在
+            if not data.get("experience"):
+                data["experience"] = "不明"
 
-        for attachment in attachments:
-            filename = attachment.get("filename", "").lower()
-
-            # 检查文件扩展名
-            has_resume_extension = any(
-                filename.endswith(ext) for ext in resume_extensions
+            return ResumeData(**data)
+        else:
+            logger.error(
+                f"Failed to parse JSON from AI response for resume: {filename}"
             )
+            return None
 
-            # 检查文件名关键词
-            has_resume_keyword = any(
-                re.search(pattern, filename) for pattern in engineer_patterns
-            )
+    except Exception as e:
+        logger.error(f"Error extracting resume data from {filename}: {e}")
+        import traceback
 
-            if has_resume_extension or has_resume_keyword:
-                resume_files.append(attachment)
-                logger.info(f"发现可能的简历文件: {filename}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None
 
-        if not resume_files:
-            logger.info("未发现简历附件")
-            return resume_data_list
 
-        logger.info(f"开始处理 {len(resume_files)} 个简历文件")
+async def process_resume_attachments(self, attachments: List[Dict]) -> List[ResumeData]:
+    """处理所有简历附件，返回提取的简历数据列表"""
+    resume_data_list = []
 
-        for attachment in resume_files:
-            filename = attachment.get("filename", "")
-            logger.info(f"正在处理简历文件: {filename}")
+    # 过滤出可能的简历文件
+    resume_files = []
+    resume_extensions = [".docx", ".doc", ".pdf", ".xlsx", ".xls"]
+    engineer_patterns = [
+        r"履歴書",
+        r"職務経歴",
+        r"スキルシート",
+        r"resume",
+        r"cv",
+        r"profile",
+    ]
 
-            try:
-                # 提取文本内容
-                resume_text = self.extract_text_from_attachment(attachment)
+    logger.info(f"🔍 开始分析 {len(attachments)} 个附件")
 
-                if not resume_text.strip():
-                    logger.warning(f"无法从文件 {filename} 中提取文本内容")
-                    continue
+    for attachment in attachments:
+        filename = attachment.get("filename", "").lower()
+        original_filename = attachment.get("original_filename", "")
 
-                logger.info(f"从 {filename} 提取了 {len(resume_text)} 字符的文本")
-                print(f"\n{'='*60}")
-                print(f"📄 文件名: {filename}")
-                print(f"📝 提取的文本内容:")
-                print(f"{'='*60}")
-                print(resume_text)
-                print(f"{'='*60}\n")
-                # 使用AI提取结构化数据
-                resume_data = await self.extract_resume_data_with_ai(
-                    resume_text, filename
-                )
+        logger.info(f"📄 分析文件: '{filename}' (原始: '{original_filename}')")
 
-                if resume_data:
-                    resume_data_list.append(resume_data)
-                    logger.info(f"成功提取简历数据: {resume_data.name} ({filename})")
-                else:
-                    logger.error(f"无法从 {filename} 提取简历数据")
+        # 检查文件扩展名
+        has_resume_extension = any(filename.endswith(ext) for ext in resume_extensions)
 
-            except Exception as e:
-                logger.error(f"处理简历文件 {filename} 时出错: {e}")
-                continue
+        # 检查文件名关键词
+        has_resume_keyword = any(
+            re.search(pattern, filename) for pattern in engineer_patterns
+        )
 
-        logger.info(f"简历处理完成，成功提取 {len(resume_data_list)} 份简历数据")
+        logger.info(f"   扩展名匹配: {has_resume_extension}")
+        logger.info(f"   关键词匹配: {has_resume_keyword}")
+
+        if has_resume_extension or has_resume_keyword:
+            resume_files.append(attachment)
+            logger.info(f"✅ 确认为简历文件: {filename}")
+
+    if not resume_files:
+        logger.info("📭 未发现简历附件")
         return resume_data_list
 
-    def has_resume_attachments(self, attachments: List[Dict]) -> bool:
-        """检查是否包含简历附件"""
-        if not attachments:
-            return False
+    logger.info(f"📋 开始处理 {len(resume_files)} 个简历文件")
 
-        resume_extensions = [".docx", ".doc", ".pdf", ".xlsx", ".xls"]
-        engineer_patterns = [
-            r"履歴書",
-            r"職務経歴",
-            r"スキルシート",
-            r"resume",
-            r"cv",
-            r"profile",
-        ]
+    for attachment in resume_files:
+        filename = attachment.get("filename", "")
+        logger.info(f"🔄 正在处理简历文件: {filename}")
 
-        for attachment in attachments:
-            filename = attachment.get("filename", "").lower()
+        try:
+            # 提取文本内容
+            resume_text = self.extract_text_from_attachment(attachment)
 
-            # 检查文件扩展名
-            has_resume_extension = any(
-                filename.endswith(ext) for ext in resume_extensions
-            )
+            if not resume_text.strip():
+                logger.warning(f"⚠️ 无法从文件 {filename} 中提取文本内容")
+                continue
 
-            # 检查文件名关键词
-            has_resume_keyword = any(
-                re.search(pattern, filename) for pattern in engineer_patterns
-            )
+            logger.info(f"📝 从 {filename} 提取了 {len(resume_text)} 字符的文本")
 
-            if has_resume_extension or has_resume_keyword:
-                return True
+            # 🔧 添加文本内容的控制台输出
+            print(f"\n{'='*60}")
+            print(f"📄 文件名: {filename}")
+            print(f"📝 提取的文本内容:")
+            print(f"{'='*60}")
+            print(resume_text)
+            print(f"{'='*60}\n")
 
+            # 使用AI提取结构化数据
+            resume_data = await self.extract_resume_data_with_ai(resume_text, filename)
+
+            if resume_data:
+                resume_data_list.append(resume_data)
+                logger.info(f"✅ 成功提取简历数据: {resume_data.name} ({filename})")
+            else:
+                logger.error(f"❌ 无法从 {filename} 提取简历数据")
+
+        except Exception as e:
+            logger.error(f"💥 处理简历文件 {filename} 时出错: {e}")
+            import traceback
+
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            continue
+
+    logger.info(f"🎯 简历处理完成，成功提取 {len(resume_data_list)} 份简历数据")
+    return resume_data_list
+
+
+def has_resume_attachments(self, attachments: List[Dict]) -> bool:
+    """检查是否包含简历附件"""
+    if not attachments:
+        logger.info("📎 没有附件")
         return False
+
+    resume_extensions = [".docx", ".doc", ".pdf", ".xlsx", ".xls"]
+    engineer_patterns = [
+        r"履歴書",
+        r"職務経歴",
+        r"スキルシート",
+        r"resume",
+        r"cv",
+        r"profile",
+    ]
+
+    logger.info(f"📎 检查 {len(attachments)} 个附件是否为简历文件")
+
+    for i, attachment in enumerate(attachments, 1):
+        filename = attachment.get("filename", "").lower()
+        original_filename = attachment.get("original_filename", "")
+
+        logger.info(f"📄 附件 {i}: '{filename}' (原始: '{original_filename}')")
+
+        # 检查文件扩展名
+        has_resume_extension = any(filename.endswith(ext) for ext in resume_extensions)
+
+        if has_resume_extension:
+            logger.info(f"✅ 附件 {i} 匹配简历扩展名")
+        else:
+            logger.info(f"❌ 附件 {i} 不匹配简历扩展名 {resume_extensions}")
+
+        # 检查文件名关键词
+        has_resume_keyword = any(
+            re.search(pattern, filename) for pattern in engineer_patterns
+        )
+
+        if has_resume_keyword:
+            logger.info(f"✅ 附件 {i} 匹配简历关键词")
+        else:
+            logger.info(f"❌ 附件 {i} 不匹配简历关键词 {engineer_patterns}")
+
+        if has_resume_extension or has_resume_keyword:
+            logger.info(f"🎯 确认附件 {i} 为简历文件")
+            return True
+
+    logger.info("📭 未发现简历附件")
+    return False
