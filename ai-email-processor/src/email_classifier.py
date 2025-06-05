@@ -9,6 +9,7 @@ from enum import Enum
 
 import httpx
 from openai import AsyncOpenAI
+from src.no_auth_processor import NoAuthCustomAPIProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,12 @@ class EmailClassifier:
 
         provider_name = ai_config.get("provider_name")
         api_key = ai_config.get("api_key")
+        require_auth = ai_config.get("require_auth", True)
 
         if provider_name == "openai":
             if api_key:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
-            else:
-                logger.error("OpenAI API key not found")
-        elif provider_name in ["deepseek", "custom"]:
+        elif provider_name in ["deepseek"]:
             api_base_url = ai_config.get("api_base_url")
             timeout = ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
@@ -47,9 +47,27 @@ class EmailClassifier:
                     },
                     timeout=timeout,
                 )
-                logger.info(f"{provider_name.title()} client initialized")
-            else:
-                logger.error(f"{provider_name.title()} API key or base URL not found")
+        elif provider_name == "custom":
+            api_base_url = ai_config.get("api_base_url")
+            timeout = ai_config.get("timeout", 120.0)
+            default_model = ai_config.get("default_model", "default")
+
+            if api_base_url:
+                if require_auth and api_key:
+                    self.ai_client = httpx.AsyncClient(
+                        base_url=api_base_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=timeout,
+                    )
+                elif not require_auth:
+                    self.ai_client = NoAuthCustomAPIProcessor(
+                        api_base_url=api_base_url,
+                        default_model=default_model,
+                        timeout=timeout,
+                    )
 
         self._init_classification_components()
 
@@ -676,7 +694,7 @@ JSONのみで回答してください。
                 )
                 content = response.choices[0].message.content.strip()
 
-            elif provider_name in ["deepseek", "custom"]:
+            elif provider_name == "deepseek":
                 response = await self.ai_client.post(
                     "/v1/chat/completions",
                     json={
@@ -689,6 +707,39 @@ JSONのみで回答してください。
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"].strip()
+
+            elif provider_name == "custom":
+                if isinstance(self.ai_client, NoAuthCustomAPIProcessor):
+                    # 使用无认证处理器
+                    email_data_simple = {
+                        "subject": email_data.get("subject", ""),
+                        "body_text": extracted_content,
+                    }
+                    category = await self.ai_client.classify_email(
+                        email_data_simple, model_classify
+                    )
+                    if "engineer" in category:
+                        return EmailType.ENGINEER_RELATED
+                    elif "project" in category:
+                        return EmailType.PROJECT_RELATED
+                    elif "other" in category:
+                        return EmailType.OTHER
+                    else:
+                        return EmailType.UNCLASSIFIED
+                else:
+                    # 使用认证的httpx客户端
+                    response = await self.ai_client.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": model_classify,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                        },
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"].strip()
             else:
                 raise ValueError(f"Unsupported AI provider: {provider_name}")
 

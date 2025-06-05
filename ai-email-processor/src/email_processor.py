@@ -25,6 +25,7 @@ from src.encryption_utils import decrypt, DecryptionError
 from src.config import Config
 from src.email_classifier import EmailClassifier, EmailType
 from src.attachment_processor import AttachmentProcessor, ResumeData
+from src.no_auth_processor import NoAuthCustomAPIProcessor
 
 # ロギング設定
 logging.basicConfig(
@@ -394,7 +395,9 @@ class EmailProcessor:
         self.db_config = db_config
         self.ai_config = ai_config
         self.db_pool: Optional[asyncpg.Pool] = None
-        self.ai_client: Optional[AsyncOpenAI | httpx.AsyncClient] = None
+        self.ai_client: Optional[
+            AsyncOpenAI | httpx.AsyncClient | NoAuthCustomAPIProcessor
+        ] = None
 
         # 初始化分类器和附件处理器
         self.classifier = EmailClassifier(ai_config)
@@ -402,14 +405,15 @@ class EmailProcessor:
 
         provider_name = self.ai_config.get("provider_name")
         api_key = self.ai_config.get("api_key")
+        api_base_url = self.ai_config.get("api_base_url")
+        require_auth = self.ai_config.get("require_auth", True)
 
         if provider_name == "openai":
             if api_key:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
             else:
                 logger.error("OpenAI API key not found in config")
-        elif provider_name in ["deepseek", "custom"]:
-            api_base_url = self.ai_config.get("api_base_url")
+        elif provider_name == "deepseek":
             timeout = self.ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
                 self.ai_client = httpx.AsyncClient(
@@ -420,9 +424,37 @@ class EmailProcessor:
                     },
                     timeout=timeout,
                 )
-                logger.info(f"{provider_name.title()} client initialized")
+                logger.info("DeepSeek client initialized")
             else:
-                logger.error(f"{provider_name.title()} API key or base URL not found")
+                logger.error("DeepSeek API key or base URL not found")
+        elif provider_name == "custom":
+            timeout = self.ai_config.get("timeout", 120.0)
+            default_model = self.ai_config.get("default_model", "default")
+
+            if api_base_url:
+                if require_auth and api_key:
+                    # 需要认证的自定义API
+                    self.ai_client = httpx.AsyncClient(
+                        base_url=api_base_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=timeout,
+                    )
+                    logger.info("Custom API client initialized (with auth)")
+                elif not require_auth:
+                    # 无需认证的自定义API
+                    self.ai_client = NoAuthCustomAPIProcessor(
+                        api_base_url=api_base_url,
+                        default_model=default_model,
+                        timeout=timeout,
+                    )
+                    logger.info("Custom API client initialized (no auth)")
+                else:
+                    logger.error("Custom API requires auth but no API key provided")
+            else:
+                logger.error("Custom API base URL not found")
 
     async def initialize(self):
         """初期化処理"""

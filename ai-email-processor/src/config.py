@@ -51,10 +51,15 @@ class Config:
             "timeout": float(os.getenv("DEEPSEEK_TIMEOUT", 120.0)),
         },
         "custom": {
-            "api_key": os.getenv("CUSTOM_API_KEY"),
+            "api_key": os.getenv("CUSTOM_API_KEY"),  # 允许为空
             "api_base_url": os.getenv("CUSTOM_API_BASE_URL"),
-            "model_classify": os.getenv("CUSTOM_MODEL_CLASSIFY", "gpt-3.5-turbo"),
-            "model_extract": os.getenv("CUSTOM_MODEL_EXTRACT", "gpt-4"),
+            "model_classify": os.getenv("CUSTOM_MODEL_CLASSIFY")
+            or os.getenv("CUSTOM_DEFAULT_MODEL", "default"),
+            "model_extract": os.getenv("CUSTOM_MODEL_EXTRACT")
+            or os.getenv("CUSTOM_DEFAULT_MODEL", "default"),
+            "require_auth": os.getenv("CUSTOM_REQUIRE_AUTH", "true").lower()
+            == "true",  # 新增
+            "default_model": os.getenv("CUSTOM_DEFAULT_MODEL", "default"),  # 新增
             "temperature": float(os.getenv("CUSTOM_TEMPERATURE", 0.1)),
             "max_tokens": int(os.getenv("CUSTOM_MAX_TOKENS", 300)),
             "timeout": float(os.getenv("CUSTOM_TIMEOUT", 120.0)),
@@ -158,17 +163,26 @@ class Config:
         if not cls.DATABASE["password"]:
             errors.append("Database password is not set")
 
-        # AI プロバイダーの検証
         if cls.DEFAULT_AI_PROVIDER not in cls.AI_PROVIDERS:
             errors.append(
                 f"Default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not defined in AI_PROVIDERS."
             )
         else:
             default_provider_config = cls.AI_PROVIDERS[cls.DEFAULT_AI_PROVIDER]
-            if not default_provider_config.get("api_key"):
-                errors.append(
-                    f"API key for the default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not set."
-                )
+
+            # 只有当require_auth为true时才检查API key
+            if cls.DEFAULT_AI_PROVIDER == "custom":
+                require_auth = default_provider_config.get("require_auth", True)
+                if require_auth and not default_provider_config.get("api_key"):
+                    errors.append(
+                        f"API key for custom provider is required when CUSTOM_REQUIRE_AUTH=true."
+                    )
+            else:
+                # 其他提供商仍然需要API key
+                if not default_provider_config.get("api_key"):
+                    errors.append(
+                        f"API key for the default AI provider '{cls.DEFAULT_AI_PROVIDER}' is not set."
+                    )
 
             # 验证需要api_base_url的提供商
             if cls.DEFAULT_AI_PROVIDER in ["deepseek", "custom"]:
