@@ -1,5 +1,5 @@
 # scripts/run_scheduler.py
-"""スケジューラーの実行スクリプト"""
+"""更新的调度器运行脚本 - 重构版本"""
 
 import sys
 import os
@@ -7,13 +7,13 @@ import asyncio
 import logging
 import signal
 
-# プロジェクトのルートディレクトリをPythonパスに追加
+# 添加项目根目录到Python路径
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.scheduler import EmailScheduler
 from src.config import Config
 
-# ロギング設定
+# 日志设置
 logging.basicConfig(
     level=getattr(logging, Config.LOGGING["level"]),
     format=Config.LOGGING["format"],
@@ -33,7 +33,7 @@ scheduler = None
 
 
 def signal_handler(sig, frame):
-    """シグナルハンドラー"""
+    """信号处理器"""
     logger.info("Received interrupt signal. Shutting down...")
     if scheduler:
         scheduler.stop()
@@ -41,18 +41,22 @@ def signal_handler(sig, frame):
 
 
 if __name__ == "__main__":
-    # 設定の検証
+    # 配置验证
     try:
         Config.validate()
+        logger.info("✅ Configuration validation passed")
     except ValueError as e:
-        logger.error(f"Configuration error: {e}")
+        logger.error(f"❌ Configuration error: {e}")
         sys.exit(1)
 
-    # シグナルハンドラーの設定
+    # 打印配置信息
+    Config.print_ai_service_mapping_info()
+
+    # 信号处理器设置
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # スケジューラーの起動
+    # 调度器启动
     scheduler = EmailScheduler(
         interval_minutes=Config.EMAIL_PROCESSING["interval_minutes"]
     )
@@ -60,7 +64,7 @@ if __name__ == "__main__":
     logger.info("Starting email processing scheduler...")
 
     try:
-        # イベントループを作成して実行
+        # 创建并运行事件循环
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(scheduler.start_async())
