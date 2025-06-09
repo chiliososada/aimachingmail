@@ -1,5 +1,5 @@
 # src/email_classifier.py
-"""邮件分类模块 - 改进版本，修复工程师邮件误分类问题"""
+"""邮件分类模块 - 分离式AI服务版本"""
 
 import re
 import json
@@ -10,6 +10,7 @@ from enum import Enum
 import httpx
 from openai import AsyncOpenAI
 from src.no_auth_processor import NoAuthCustomAPIProcessor
+from src.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -22,22 +23,48 @@ class EmailType(str, Enum):
 
 
 class EmailClassifier:
-    """邮件分类器 - 改进版本"""
+    """邮件分类器 - 分离式AI服务版本"""
 
-    def __init__(self, ai_config: Dict):
-        self.ai_config = ai_config
+    def __init__(self, classification_ai_config: Dict = None):
+        """
+        初始化分类器
+
+        Args:
+            classification_ai_config: 分类专用AI配置，如果为None则自动获取
+        """
+        # 获取分类服务的AI配置
+        if classification_ai_config is None:
+            self.ai_config = Config.get_ai_config_for_service("classification")
+        else:
+            self.ai_config = classification_ai_config
+
         self.ai_client = None
+        self.fallback_client = None
 
-        provider_name = ai_config.get("provider_name")
-        api_key = ai_config.get("api_key")
-        require_auth = ai_config.get("require_auth", True)
+        # 初始化主要AI客户端
+        self._initialize_ai_client()
+
+        # 初始化后备AI客户端
+        self._initialize_fallback_client()
+
+        # 初始化分类组件
+        self._init_classification_components()
+
+    def _initialize_ai_client(self):
+        """初始化主要AI客户端"""
+        provider_name = self.ai_config.get("provider_name")
+        api_key = self.ai_config.get("api_key")
+        require_auth = self.ai_config.get("require_auth", True)
+
+        logger.info(f"初始化分类AI客户端: {provider_name}")
 
         if provider_name == "openai":
             if api_key:
                 self.ai_client = AsyncOpenAI(api_key=api_key)
-        elif provider_name in ["deepseek"]:
-            api_base_url = ai_config.get("api_base_url")
-            timeout = ai_config.get("timeout", 120.0)
+                logger.info("OpenAI 分类客户端初始化成功")
+        elif provider_name == "deepseek":
+            api_base_url = self.ai_config.get("api_base_url")
+            timeout = self.ai_config.get("timeout", 120.0)
             if api_key and api_base_url:
                 self.ai_client = httpx.AsyncClient(
                     base_url=api_base_url,
@@ -47,10 +74,10 @@ class EmailClassifier:
                     },
                     timeout=timeout,
                 )
+                logger.info("DeepSeek 分类客户端初始化成功")
         elif provider_name == "custom":
-            api_base_url = ai_config.get("api_base_url")
-            timeout = ai_config.get("timeout", 120.0)
-            default_model = ai_config.get("default_model", "default")
+            api_base_url = self.ai_config.get("api_base_url")
+            timeout = self.ai_config.get("timeout", 120.0)
 
             if api_base_url:
                 if require_auth and api_key:
@@ -62,14 +89,102 @@ class EmailClassifier:
                         },
                         timeout=timeout,
                     )
+                    logger.info("Custom API 分类客户端初始化成功 (认证)")
                 elif not require_auth:
+                    default_model = self.ai_config.get("default_model", "default")
                     self.ai_client = NoAuthCustomAPIProcessor(
                         api_base_url=api_base_url,
                         default_model=default_model,
                         timeout=timeout,
                     )
+                    logger.info("Custom API 分类客户端初始化成功 (无认证)")
+        elif provider_name == "custom_no_auth":
+            api_base_url = self.ai_config.get("api_base_url")
+            timeout = self.ai_config.get("timeout", 120.0)
+            default_model = self.ai_config.get("default_model", "default")
 
-        self._init_classification_components()
+            if api_base_url:
+                self.ai_client = NoAuthCustomAPIProcessor(
+                    api_base_url=api_base_url,
+                    default_model=default_model,
+                    timeout=timeout,
+                )
+                logger.info("无认证Custom API 分类客户端初始化成功")
+            else:
+                logger.error("无认证Custom API base URL未设置")
+
+        if not self.ai_client:
+            logger.error(f"分类AI客户端初始化失败: {provider_name}")
+
+    def _initialize_fallback_client(self):
+        """初始化后备AI客户端"""
+        try:
+            fallback_config = Config.get_ai_config_for_service(
+                "classification", use_fallback=True
+            )
+            fallback_provider = fallback_config.get("provider_name")
+
+            if fallback_provider == self.ai_config.get("provider_name"):
+                logger.info("主要和后备提供商相同，跳过后备客户端初始化")
+                return
+
+            logger.info(f"初始化后备分类AI客户端: {fallback_provider}")
+
+            api_key = fallback_config.get("api_key")
+            require_auth = fallback_config.get("require_auth", True)
+
+            if fallback_provider == "openai":
+                if api_key:
+                    self.fallback_client = AsyncOpenAI(api_key=api_key)
+                    logger.info("OpenAI 后备分类客户端初始化成功")
+            elif fallback_provider == "deepseek":
+                api_base_url = fallback_config.get("api_base_url")
+                timeout = fallback_config.get("timeout", 120.0)
+                if api_key and api_base_url:
+                    self.fallback_client = httpx.AsyncClient(
+                        base_url=api_base_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=timeout,
+                    )
+                    logger.info("DeepSeek 后备分类客户端初始化成功")
+            elif fallback_provider in ["custom", "custom_no_auth"]:
+                api_base_url = fallback_config.get("api_base_url")
+                timeout = fallback_config.get("timeout", 120.0)
+                default_model = fallback_config.get("default_model", "default")
+
+                if api_base_url:
+                    if fallback_provider == "custom_no_auth" or not require_auth:
+                        self.fallback_client = NoAuthCustomAPIProcessor(
+                            api_base_url=api_base_url,
+                            default_model=default_model,
+                            timeout=timeout,
+                        )
+                        logger.info(
+                            f"{fallback_provider} 后备分类客户端初始化成功 (无认证)"
+                        )
+                    elif require_auth and api_key:
+                        self.fallback_client = httpx.AsyncClient(
+                            base_url=api_base_url,
+                            headers={
+                                "Authorization": f"Bearer {api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            timeout=timeout,
+                        )
+                        logger.info(
+                            f"{fallback_provider} 后备分类客户端初始化成功 (认证)"
+                        )
+
+            # 保存后备配置以供使用
+            self.fallback_config = fallback_config
+
+        except Exception as e:
+            logger.warning(f"后备分类AI客户端初始化失败: {e}")
+            self.fallback_client = None
+            self.fallback_config = None
 
     def _init_classification_components(self):
         """初始化分类器相关组件"""
@@ -510,7 +625,7 @@ class EmailClassifier:
         return spam_count >= 2 or sender_suspicious
 
     async def classify_email(self, email_data: Dict) -> EmailType:
-        """邮件分类主方法 - 改进版本"""
+        """邮件分类主方法 - 分离式AI版本"""
         try:
             logger.info(f"开始分类邮件: {email_data.get('subject', 'No Subject')}")
 
@@ -626,11 +741,63 @@ class EmailClassifier:
         sender_analysis: Dict,
         structure_analysis: Dict,
     ) -> EmailType:
-        """调用AI进行分类 - 改进版本，支持自定义API"""
-        provider_name = self.ai_config.get("provider_name")
-        model_classify = self.ai_config.get("model_classify", "gpt-3.5-turbo")
-        temperature = self.ai_config.get("temperature", 0.1)
-        max_tokens = self.ai_config.get("max_tokens", 200)
+        """调用AI进行分类 - 分离式AI版本，支持fallback"""
+
+        # 首先尝试主要AI客户端
+        try:
+            result = await self._call_ai_classifier_with_client(
+                self.ai_client,
+                self.ai_config,
+                email_data,
+                extracted_content,
+                sender_analysis,
+                structure_analysis,
+                "主要",
+            )
+            if result != EmailType.UNCLASSIFIED:
+                return result
+        except Exception as e:
+            logger.warning(f"主要AI分类客户端调用失败: {e}")
+
+        # 如果主要客户端失败，尝试后备客户端
+        if self.fallback_client and hasattr(self, "fallback_config"):
+            try:
+                logger.info("尝试使用后备AI客户端进行分类")
+                result = await self._call_ai_classifier_with_client(
+                    self.fallback_client,
+                    self.fallback_config,
+                    email_data,
+                    extracted_content,
+                    sender_analysis,
+                    structure_analysis,
+                    "后备",
+                )
+                if result != EmailType.UNCLASSIFIED:
+                    return result
+            except Exception as e:
+                logger.warning(f"后备AI分类客户端调用失败: {e}")
+
+        logger.warning("所有AI客户端都失败，返回UNCLASSIFIED")
+        return EmailType.UNCLASSIFIED
+
+    async def _call_ai_classifier_with_client(
+        self,
+        client,
+        config: Dict,
+        email_data: Dict,
+        extracted_content: str,
+        sender_analysis: Dict,
+        structure_analysis: Dict,
+        client_type: str = "未知",
+    ) -> EmailType:
+        """使用指定的AI客户端进行分类"""
+
+        provider_name = config.get("provider_name")
+        model_classify = config.get("model_classify", "gpt-3.5-turbo")
+        temperature = config.get("temperature", 0.1)
+        max_tokens = config.get("max_tokens", 200)
+
+        logger.info(f"使用{client_type}AI客户端进行分类: {provider_name}")
 
         # 构建更精确的提示词，强调个人技术者介绍的识别
         prompt = f"""
@@ -686,7 +853,7 @@ JSONのみで回答してください。
 
         try:
             if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model_classify,
                     messages=messages,
                     temperature=temperature,
@@ -694,41 +861,9 @@ JSONのみで回答してください。
                 )
                 content = response.choices[0].message.content.strip()
 
-            elif provider_name == "deepseek":
-                response = await self.ai_client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": model_classify,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"].strip()
-
-            elif provider_name == "custom":
-                if isinstance(self.ai_client, NoAuthCustomAPIProcessor):
-                    # 使用无认证处理器
-                    email_data_simple = {
-                        "subject": email_data.get("subject", ""),
-                        "body_text": extracted_content,
-                    }
-                    category = await self.ai_client.classify_email(
-                        email_data_simple, model_classify
-                    )
-                    if "engineer" in category:
-                        return EmailType.ENGINEER_RELATED
-                    elif "project" in category:
-                        return EmailType.PROJECT_RELATED
-                    elif "other" in category:
-                        return EmailType.OTHER
-                    else:
-                        return EmailType.UNCLASSIFIED
-                else:
-                    # 使用认证的httpx客户端
-                    response = await self.ai_client.post(
+            elif provider_name in ["deepseek", "custom"]:
+                if isinstance(client, httpx.AsyncClient):
+                    response = await client.post(
                         "/v1/chat/completions",
                         json={
                             "model": model_classify,
@@ -740,205 +875,80 @@ JSONのみで回答してください。
                     response.raise_for_status()
                     data = response.json()
                     content = data["choices"][0]["message"]["content"].strip()
+                else:
+                    # NoAuthCustomAPIProcessor
+                    email_data_simple = {
+                        "subject": email_data.get("subject", ""),
+                        "body_text": extracted_content,
+                    }
+                    category = await client.classify_email(
+                        email_data_simple, model_classify
+                    )
+                    if "engineer" in category:
+                        return EmailType.ENGINEER_RELATED
+                    elif "project" in category:
+                        return EmailType.PROJECT_RELATED
+                    elif "other" in category:
+                        return EmailType.OTHER
+                    else:
+                        return EmailType.UNCLASSIFIED
+
+            elif provider_name in ["custom_no_auth"]:
+                if isinstance(client, NoAuthCustomAPIProcessor):
+                    email_data_simple = {
+                        "subject": email_data.get("subject", ""),
+                        "body_text": extracted_content,
+                    }
+                    category = await client.classify_email(
+                        email_data_simple, model_classify
+                    )
+                    if "engineer" in category:
+                        return EmailType.ENGINEER_RELATED
+                    elif "project" in category:
+                        return EmailType.PROJECT_RELATED
+                    elif "other" in category:
+                        return EmailType.OTHER
+                    else:
+                        return EmailType.UNCLASSIFIED
             else:
                 raise ValueError(f"Unsupported AI provider: {provider_name}")
 
-            # 解析AI响应
-            try:
-                json_match = re.search(r"\{.*\}", content, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                else:
-                    result = json.loads(content)
+            # 解析AI响应（对于返回JSON的提供商）
+            if "content" in locals():
+                try:
+                    json_match = re.search(r"\{.*\}", content, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+                    else:
+                        result = json.loads(content)
 
-                category_str = result.get("category", "unclassified")
-                confidence = float(result.get("confidence", 0.5))
-                reasoning = result.get("reasoning", "AI分析结果")
+                    category_str = result.get("category", "unclassified")
+                    confidence = float(result.get("confidence", 0.5))
+                    reasoning = result.get("reasoning", "AI分析结果")
 
-                logger.info(f"AI分类结果: {category_str}, 置信度: {confidence:.2f}")
-                logger.info(f"AI推理: {reasoning}")
+                    logger.info(
+                        f"{client_type}AI分类结果: {category_str}, 置信度: {confidence:.2f}"
+                    )
+                    logger.info(f"{client_type}AI推理: {reasoning}")
 
-                if "engineer" in category_str:
-                    return EmailType.ENGINEER_RELATED
-                elif "project" in category_str:
-                    return EmailType.PROJECT_RELATED
-                elif "other" in category_str:
-                    return EmailType.OTHER
-                else:
-                    return EmailType.UNCLASSIFIED
+                    if "engineer" in category_str:
+                        return EmailType.ENGINEER_RELATED
+                    elif "project" in category_str:
+                        return EmailType.PROJECT_RELATED
+                    elif "other" in category_str:
+                        return EmailType.OTHER
+                    else:
+                        return EmailType.UNCLASSIFIED
 
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"AI响应解析失败: {e}, 内容: {content}")
-                return self._extract_category_from_text(content)
-
-        except Exception as e:
-            logger.error(f"AI分类调用失败: {e}")
-            return EmailType.UNCLASSIFIED
-
-    def _extract_category_from_text(self, text: str) -> EmailType:
-        """从文本中提取分类信息（AI返回非JSON时的备用方法）"""
-        text_lower = text.lower()
-
-        if "engineer" in text_lower:
-            return EmailType.ENGINEER_RELATED
-        elif "project" in text_lower:
-            return EmailType.PROJECT_RELATED
-        elif "other" in text_lower:
-            return EmailType.OTHER
-        else:
-            return EmailType.UNCLASSIFIED
-
-    def _fallback_classification(
-        self,
-        content: str,
-        project_score: float,
-        engineer_score: float,
-        project_keywords: List[str],
-        engineer_keywords: List[str],
-    ) -> EmailType:
-        """备用分类逻辑 - 改进版本"""
-        logger.info(
-            f"使用备用分类逻辑 - 项目得分: {project_score:.1f}, 工程师得分: {engineer_score:.1f}"
-        )
-
-        # 提高判断阈值，避免误分类
-        if engineer_score > project_score and engineer_score > 3.0:
-            logger.info(f"备用分类: engineer_related, 关键词: {engineer_keywords[:3]}")
-            return EmailType.ENGINEER_RELATED
-        elif project_score > engineer_score and project_score > 3.0:
-            logger.info(f"备用分类: project_related, 关键词: {project_keywords[:3]}")
-            return EmailType.PROJECT_RELATED
-        elif any(
-            word in content.lower() for word in ["説明会", "案内", "勉強会", "セミナー"]
-        ):
-            logger.info("备用分类: other")
-            return EmailType.OTHER
-        else:
-            logger.info("备用分类: unclassified")
-            return EmailType.UNCLASSIFIED
-
-    async def _call_ai_classifier(
-        self,
-        email_data: Dict,
-        extracted_content: str,
-        sender_analysis: Dict,
-        structure_analysis: Dict,
-    ) -> EmailType:
-        """调用AI进行分类 - 改进版本"""
-        provider_name = self.ai_config.get("provider_name")
-        model_classify = self.ai_config.get("model_classify", "gpt-3.5-turbo")
-        temperature = self.ai_config.get("temperature", 0.1)
-        max_tokens = self.ai_config.get("max_tokens", 200)
-
-        # 构建更精确的提示词，强调个人技术者介绍的识别
-        prompt = f"""
-あなたは日本のIT業界の専門メール分類システムです。以下のメールを正確に分類してください。
-
-【メール内容】
-件名: {email_data.get('subject', '')}
-送信者: {email_data.get('sender_email', '')}
-本文: {extracted_content[:1500]}
-
-【構造分析情報】
-- 個人情報項目数: {structure_analysis['personal_info_count']}
-- プロジェクト情報項目数: {structure_analysis['project_info_count']}
-- 超強工程師指示符分数: {structure_analysis['ultra_engineer_score']}
-- 超強項目指示符分数: {structure_analysis['ultra_project_score']}
-
-【重要な分類基準】
-1. engineer_related（技術者関連）:
-   ✓ 個人の技術者・エンジニアの紹介メール
-   ✓ 「要員ご紹介」「人材ご紹介」「技術者ご紹介」の表現
-   ✓ 【氏名】【年齢】【性別】【最寄駅】【実務経験】【単価】【稼働日】などの個人情報
-   ✓ 履歴書・職務経歴書の送付や添付
-   ✓ 個人のスキル、経験、人柄の紹介
-
-2. project_related（案件関連）:
-   ✓ IT案件・プロジェクトの募集
-   ✓ 開発案件の詳細説明
-   ✓ 【案件名】【必須スキル】【歓迎スキル】【勤務地】【期間】などの案件情報
-   ✓ 参画者募集、応募締切の記載
-
-3. other: 業界関連の重要メール（勉強会、サービス紹介等）
-4. unclassified: 無関係またはspam
-
-【特別注意事項】
-- 「要員ご紹介」「人材ご紹介」は100%engineer_relatedです
-- 【氏名】【年齢】などの個人情報フォーマットはengineer_relatedの強い指標です
-- 技術スキルが記載されていても、個人の紹介文脈ならengineer_relatedです
-- 募集文脈でなく紹介文脈かを重視してください
-
-【出力形式】
-{{"category": "カテゴリー名", "confidence": 0.0-1.0, "reasoning": "判定理由"}}
-
-JSONのみで回答してください。
-"""
-
-        messages = [
-            {
-                "role": "system",
-                "content": "あなたは高精度なメール分類の専門家です。個人の技術者紹介は必ずengineer_relatedに分類してください。「要員ご紹介」は100%engineer_relatedです。",
-            },
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
-                    model=model_classify,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                content = response.choices[0].message.content.strip()
-
-            elif provider_name == "deepseek":
-                response = await self.ai_client.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": model_classify,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"].strip()
-            else:
-                raise ValueError(f"Unsupported AI provider: {provider_name}")
-
-            # 解析AI响应
-            try:
-                json_match = re.search(r"\{.*\}", content, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                else:
-                    result = json.loads(content)
-
-                category_str = result.get("category", "unclassified")
-                confidence = float(result.get("confidence", 0.5))
-                reasoning = result.get("reasoning", "AI分析结果")
-
-                logger.info(f"AI分类结果: {category_str}, 置信度: {confidence:.2f}")
-                logger.info(f"AI推理: {reasoning}")
-
-                if "engineer" in category_str:
-                    return EmailType.ENGINEER_RELATED
-                elif "project" in category_str:
-                    return EmailType.PROJECT_RELATED
-                elif "other" in category_str:
-                    return EmailType.OTHER
-                else:
-                    return EmailType.UNCLASSIFIED
-
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"AI响应解析失败: {e}, 内容: {content}")
-                return self._extract_category_from_text(content)
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"{client_type}AI响应解析失败: {e}, 内容: {content}")
+                    return self._extract_category_from_text(content)
 
         except Exception as e:
-            logger.error(f"AI分类调用失败: {e}")
-            return EmailType.UNCLASSIFIED
+            logger.error(f"{client_type}AI分类调用失败: {e}")
+            raise  # 重新抛出异常，让上层处理fallback
+
+        return EmailType.UNCLASSIFIED
 
     def _extract_category_from_text(self, text: str) -> EmailType:
         """从文本中提取分类信息（AI返回非JSON时的备用方法）"""

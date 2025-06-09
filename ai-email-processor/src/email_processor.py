@@ -1,5 +1,5 @@
 # src/email_processor.py
-"""主要邮件处理模块 - 重构版（修复Pydantic验证错误和数据库约束问题）"""
+"""主要邮件处理模块 - 分离式AI服务版本 - 完整修复版"""
 
 import os
 import json
@@ -60,7 +60,7 @@ class SMTPSettings:
 
 
 class ProjectStructured(BaseModel):
-    """構造化された案件データ"""
+    """構造化された案件データ - 完全修复版"""
 
     title: str
     client_company: Optional[str] = None
@@ -85,6 +85,104 @@ class ProjectStructured(BaseModel):
     max_candidates: Optional[int] = 5
     manager_name: Optional[str] = None
     manager_email: Optional[str] = None
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, v):
+        """标题验证器 - 确保不为空"""
+        if not v or v is None:
+            return "案件名不明"
+        return str(v)
+
+    @field_validator("interview_count")
+    @classmethod
+    def validate_interview_count(cls, v):
+        """面试回数验证器 - 转换为字符串"""
+        if v is None:
+            return "1"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, str):
+            return v
+        return str(v)
+
+    @field_validator("processes")
+    @classmethod
+    def validate_processes(cls, v):
+        """工程列表验证器"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(item) for item in v if item is not None]
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("skills")
+    @classmethod
+    def validate_skills(cls, v):
+        """技能列表验证器"""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(item) for item in v if item is not None]
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",") if item.strip()]
+        return []
+
+    @field_validator("max_candidates")
+    @classmethod
+    def validate_max_candidates(cls, v):
+        """最大候选人数验证器"""
+        if v is None:
+            return 5
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            try:
+                return int(v)
+            except ValueError:
+                return 5
+        return 5
+
+    @field_validator("foreigner_accepted", "freelancer_accepted")
+    @classmethod
+    def validate_boolean_fields(cls, v):
+        """布尔字段验证器"""
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "yes", "可能", "可", "ok", "対応可能", "はい")
+        return False
+
+    @field_validator(
+        "client_company",
+        "partner_company",
+        "description",
+        "detail_description",
+        "key_technologies",
+        "location",
+        "work_type",
+        "start_date",
+        "duration",
+        "application_deadline",
+        "budget",
+        "desired_budget",
+        "japanese_level",
+        "experience",
+        "manager_name",
+        "manager_email",
+    )
+    @classmethod
+    def validate_optional_string_fields(cls, v):
+        """可选字符串字段验证器"""
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return str(v)
+        return str(v)
 
 
 class EngineerStructured(BaseModel):
@@ -391,32 +489,79 @@ class EngineerStructured(BaseModel):
 
 
 class EmailProcessor:
-    def __init__(self, db_config: Dict, ai_config: Dict):
+    """邮件处理器 - 分离式AI服务版本"""
+
+    def __init__(self, db_config: Dict):
+        """
+        初始化邮件处理器
+
+        Args:
+            db_config: 数据库配置
+        """
         self.db_config = db_config
-        self.ai_config = ai_config
         self.db_pool: Optional[asyncpg.Pool] = None
-        self.ai_client: Optional[
-            AsyncOpenAI | httpx.AsyncClient | NoAuthCustomAPIProcessor
-        ] = None
 
-        # 初始化分类器和附件处理器
-        self.classifier = EmailClassifier(ai_config)
-        self.attachment_processor = AttachmentProcessor(ai_config)
+        # 获取各项服务的AI配置
+        self.classification_config = Config.get_ai_config_for_service("classification")
+        self.extraction_config = Config.get_ai_config_for_service("extraction")
+        self.attachment_config = Config.get_ai_config_for_service("attachment")
 
-        provider_name = self.ai_config.get("provider_name")
-        api_key = self.ai_config.get("api_key")
-        api_base_url = self.ai_config.get("api_base_url")
-        require_auth = self.ai_config.get("require_auth", True)
+        logger.info("=== 分离式AI服务配置 ===")
+        logger.info(f"邮件分类: {self.classification_config.get('provider_name')}")
+        logger.info(f"数据提取: {self.extraction_config.get('provider_name')}")
+        logger.info(f"附件处理: {self.attachment_config.get('provider_name')}")
+
+        # 初始化各种AI客户端
+        self.extraction_clients = {}  # 数据提取AI客户端
+        self.extraction_fallback_clients = {}  # 数据提取后备客户端
+
+        # 初始化分类器（使用分类专用AI配置）
+        self.classifier = EmailClassifier(self.classification_config)
+
+        # 初始化附件处理器（使用附件专用AI配置）
+        self.attachment_processor = AttachmentProcessor(self.attachment_config)
+
+        # 初始化数据提取AI客户端
+        self._initialize_extraction_clients()
+
+    def _initialize_extraction_clients(self):
+        """初始化数据提取AI客户端"""
+        # 初始化主要提取客户端
+        self._initialize_extraction_client("primary", self.extraction_config)
+
+        # 初始化后备提取客户端
+        try:
+            fallback_config = Config.get_ai_config_for_service(
+                "extraction", use_fallback=True
+            )
+            if fallback_config.get("provider_name") != self.extraction_config.get(
+                "provider_name"
+            ):
+                self._initialize_extraction_client("fallback", fallback_config)
+            else:
+                logger.info("数据提取主要和后备提供商相同，跳过后备客户端初始化")
+        except Exception as e:
+            logger.warning(f"数据提取后备客户端初始化失败: {e}")
+
+    def _initialize_extraction_client(self, client_type: str, config: Dict):
+        """初始化指定类型的数据提取客户端"""
+        provider_name = config.get("provider_name")
+        api_key = config.get("api_key")
+        require_auth = config.get("require_auth", True)
+
+        logger.info(f"初始化{client_type}数据提取AI客户端: {provider_name}")
+
+        client = None
 
         if provider_name == "openai":
             if api_key:
-                self.ai_client = AsyncOpenAI(api_key=api_key)
-            else:
-                logger.error("OpenAI API key not found in config")
+                client = AsyncOpenAI(api_key=api_key)
+                logger.info(f"OpenAI {client_type}数据提取客户端初始化成功")
         elif provider_name == "deepseek":
-            timeout = self.ai_config.get("timeout", 120.0)
+            api_base_url = config.get("api_base_url")
+            timeout = config.get("timeout", 120.0)
             if api_key and api_base_url:
-                self.ai_client = httpx.AsyncClient(
+                client = httpx.AsyncClient(
                     base_url=api_base_url,
                     headers={
                         "Authorization": f"Bearer {api_key}",
@@ -424,17 +569,14 @@ class EmailProcessor:
                     },
                     timeout=timeout,
                 )
-                logger.info("DeepSeek client initialized")
-            else:
-                logger.error("DeepSeek API key or base URL not found")
+                logger.info(f"DeepSeek {client_type}数据提取客户端初始化成功")
         elif provider_name == "custom":
-            timeout = self.ai_config.get("timeout", 120.0)
-            default_model = self.ai_config.get("default_model", "default")
+            api_base_url = config.get("api_base_url")
+            timeout = config.get("timeout", 120.0)
 
             if api_base_url:
                 if require_auth and api_key:
-                    # 需要认证的自定义API
-                    self.ai_client = httpx.AsyncClient(
+                    client = httpx.AsyncClient(
                         base_url=api_base_url,
                         headers={
                             "Authorization": f"Bearer {api_key}",
@@ -442,19 +584,41 @@ class EmailProcessor:
                         },
                         timeout=timeout,
                     )
-                    logger.info("Custom API client initialized (with auth)")
+                    logger.info(
+                        f"Custom API {client_type}数据提取客户端初始化成功 (认证)"
+                    )
                 elif not require_auth:
-                    # 无需认证的自定义API
-                    self.ai_client = NoAuthCustomAPIProcessor(
+                    default_model = config.get("default_model", "default")
+                    client = NoAuthCustomAPIProcessor(
                         api_base_url=api_base_url,
                         default_model=default_model,
                         timeout=timeout,
                     )
-                    logger.info("Custom API client initialized (no auth)")
-                else:
-                    logger.error("Custom API requires auth but no API key provided")
+                    logger.info(
+                        f"Custom API {client_type}数据提取客户端初始化成功 (无认证)"
+                    )
+        elif provider_name == "custom_no_auth":
+            api_base_url = config.get("api_base_url")
+            timeout = config.get("timeout", 120.0)
+            default_model = config.get("default_model", "default")
+
+            if api_base_url:
+                client = NoAuthCustomAPIProcessor(
+                    api_base_url=api_base_url,
+                    default_model=default_model,
+                    timeout=timeout,
+                )
+                logger.info(f"无认证Custom API {client_type}数据提取客户端初始化成功")
+
+        if client:
+            if client_type == "primary":
+                self.extraction_clients["primary"] = client
+                self.extraction_clients["primary_config"] = config
             else:
-                logger.error("Custom API base URL not found")
+                self.extraction_clients["fallback"] = client
+                self.extraction_clients["fallback_config"] = config
+        else:
+            logger.error(f"{client_type}数据提取AI客户端初始化失败: {provider_name}")
 
     async def initialize(self):
         """初期化処理"""
@@ -465,6 +629,11 @@ class EmailProcessor:
         """クリーンアップ処理"""
         if self.db_pool:
             await self.db_pool.close()
+
+        # 关闭所有httpx客户端
+        for key, client in self.extraction_clients.items():
+            if isinstance(client, httpx.AsyncClient):
+                await client.aclose()
 
     def _extract_json_from_text(self, text: str) -> Optional[Dict]:
         """テキストからJSON部分を抽出する"""
@@ -701,7 +870,7 @@ class EmailProcessor:
                 filename = part.get_filename()
                 if filename:
                     try:
-                        # 🔧 修复：正确解码文件名
+                        # 正确解码文件名
                         decoded_filename = ""
                         if filename:
                             # 解码可能编码的文件名
@@ -744,7 +913,7 @@ class EmailProcessor:
                         # 添付ファイルの内容を取得
                         file_content = part.get_payload(decode=True)
                         attachment_data = {
-                            "filename": decoded_filename,  # 🔧 使用解码后的文件名
+                            "filename": decoded_filename,  # 使用解码后的文件名
                             "original_filename": filename,  # 保留原始文件名用于调试
                             "content_type": content_type,
                             "size": len(file_content) if file_content else 0,
@@ -752,7 +921,7 @@ class EmailProcessor:
                         }
                         attachments.append(attachment_data)
 
-                        # 🔧 改进日志，显示解码前后的文件名
+                        # 改进日志，显示解码前后的文件名
                         logger.info(
                             f"添付ファイル取得: {decoded_filename} "
                             f"(原始: {filename if filename != decoded_filename else '同じ'}) "
@@ -784,17 +953,54 @@ class EmailProcessor:
     async def extract_project_info(
         self, email_data: Dict
     ) -> Optional[ProjectStructured]:
-        """メールから案件情報を抽出して構造化"""
-        if not self.ai_client:
-            logger.warning(
-                "AI client not initialized. Skipping project info extraction."
+        """メールから案件情報を抽出して構造化 - 分离式AI版本"""
+
+        # 首先尝试主要提取客户端
+        try:
+            result = await self._extract_project_info_with_client(
+                email_data,
+                self.extraction_clients.get("primary"),
+                self.extraction_clients.get("primary_config"),
+                "主要",
             )
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(f"主要数据提取客户端调用失败: {e}")
+
+        # 如果主要客户端失败，尝试后备客户端
+        if "fallback" in self.extraction_clients:
+            try:
+                logger.info("尝试使用后备数据提取客户端")
+                result = await self._extract_project_info_with_client(
+                    email_data,
+                    self.extraction_clients.get("fallback"),
+                    self.extraction_clients.get("fallback_config"),
+                    "后备",
+                )
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(f"后备数据提取客户端调用失败: {e}")
+
+        logger.warning("所有数据提取客户端都失败")
+        return None
+
+    async def _extract_project_info_with_client(
+        self, email_data: Dict, client, config: Dict, client_type: str = "未知"
+    ) -> Optional[ProjectStructured]:
+        """使用指定客户端提取项目信息"""
+
+        if not client or not config:
+            logger.warning(f"{client_type}数据提取客户端未初始化")
             return None
 
-        provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get("model_extract", "gpt-4")
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+        provider_name = config.get("provider_name")
+        model_extract = config.get("model_extract", "gpt-4")
+        temperature = config.get("temperature", 0.3)
+        max_tokens_extract = config.get("max_tokens", 2048)
+
+        logger.info(f"使用{client_type}数据提取客户端: {provider_name}")
 
         # 使用分类器的智能内容提取
         extracted_content = self.classifier.smart_content_extraction(email_data)
@@ -823,11 +1029,11 @@ class EmailProcessor:
                 "desired_budget": "希望予算",
                 "japanese_level": "日本語レベル",
                 "experience": "必要経験",
-                "foreigner_accepted": "外国人受入可能（true/false）",
-                "freelancer_accepted": "フリーランス受入可能（true/false）",
-                "interview_count": "面接回数",
+                "foreigner_accepted": true,
+                "freelancer_accepted": true,
+                "interview_count": "1",
                 "processes": ["工程1", "工程2"],
-                "max_candidates": "最大候補者数",
+                "max_candidates": 5,
                 "manager_name": "担当者名",
                 "manager_email": "担当者メール"
             }}
@@ -836,6 +1042,11 @@ class EmailProcessor:
             - start_dateは必ずYYYY-MM-DD形式で返してください
             - 開始日が即日・すぐ等の場合は現在の日付を使用してください
             - 情報が見つからない項目はnullにしてください
+            - interview_countは文字列で返してください（例："1", "2"）
+            - processesは配列で返してください（例：["要件定義", "設計"]、見つからない場合は[]）
+            - skillsは配列で返してください（例：["Java", "Spring"]、見つからない場合は[]）
+            - foreigner_accepted, freelancer_acceptedはtrue/falseで返してください
+            - max_candidatesは数値で返してください
             - JSONのみを返してください
             """
 
@@ -849,7 +1060,7 @@ class EmailProcessor:
 
         try:
             if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model_extract,
                     messages=messages,
                     temperature=temperature,
@@ -859,8 +1070,8 @@ class EmailProcessor:
                 data = self._extract_json_from_text(raw_content)
 
             elif provider_name in ["deepseek", "custom"]:
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    response = await self.ai_client.post(
+                if isinstance(client, httpx.AsyncClient):
+                    response = await client.post(
                         "/v1/chat/completions",
                         json={
                             "model": model_extract,
@@ -875,6 +1086,26 @@ class EmailProcessor:
                         "content"
                     ]
                     data = self._extract_json_from_text(raw_response_content)
+                elif isinstance(client, NoAuthCustomAPIProcessor):
+                    # 无认证自定义API
+                    email_data_for_extraction = {
+                        "subject": email_data["subject"],
+                        "body_text": extracted_content,
+                    }
+                    data = await client.extract_structured_data(
+                        email_data_for_extraction, "project", model_extract
+                    )
+            elif provider_name == "custom_no_auth":
+                if isinstance(client, NoAuthCustomAPIProcessor):
+                    email_data_for_extraction = {
+                        "subject": email_data["subject"],
+                        "body_text": extracted_content,
+                    }
+                    data = await client.extract_structured_data(
+                        email_data_for_extraction, "project", model_extract
+                    )
+            else:
+                raise ValueError(f"Unsupported extraction provider: {provider_name}")
 
             if data:
                 # 处理日期格式，如果没有开始日期，默认为当前日期
@@ -894,11 +1125,14 @@ class EmailProcessor:
                     )
                     data["application_deadline"] = normalized_deadline
 
+                logger.info(f"{client_type}数据提取客户端成功提取项目信息")
                 return ProjectStructured(**data)
 
         except Exception as e:
-            logger.error(f"Error extracting project info: {e}")
-            return None
+            logger.error(f"{client_type}数据提取客户端提取项目信息失败: {e}")
+            raise  # 重新抛出异常以便上层处理fallback
+
+        return None
 
     async def save_email_to_db(
         self,
@@ -1126,14 +1360,54 @@ class EmailProcessor:
     async def extract_engineer_info(
         self, email_data: Dict
     ) -> Optional[EngineerStructured]:
-        """メールから技術者情報を抽出（邮件本文）- 改进版本，使用标准化提示词"""
-        if not self.ai_client:
+        """メールから技術者情報を抽出（邮件本文）- 分离式AI版本"""
+
+        # 首先尝试主要提取客户端
+        try:
+            result = await self._extract_engineer_info_with_client(
+                email_data,
+                self.extraction_clients.get("primary"),
+                self.extraction_clients.get("primary_config"),
+                "主要",
+            )
+            if result:
+                return result
+        except Exception as e:
+            logger.warning(f"主要数据提取客户端调用失败: {e}")
+
+        # 如果主要客户端失败，尝试后备客户端
+        if "fallback" in self.extraction_clients:
+            try:
+                logger.info("尝试使用后备数据提取客户端")
+                result = await self._extract_engineer_info_with_client(
+                    email_data,
+                    self.extraction_clients.get("fallback"),
+                    self.extraction_clients.get("fallback_config"),
+                    "后备",
+                )
+                if result:
+                    return result
+            except Exception as e:
+                logger.warning(f"后备数据提取客户端调用失败: {e}")
+
+        logger.warning("所有数据提取客户端都失败")
+        return None
+
+    async def _extract_engineer_info_with_client(
+        self, email_data: Dict, client, config: Dict, client_type: str = "未知"
+    ) -> Optional[EngineerStructured]:
+        """使用指定客户端提取工程师信息"""
+
+        if not client or not config:
+            logger.warning(f"{client_type}数据提取客户端未初始化")
             return None
 
-        provider_name = self.ai_config.get("provider_name")
-        model_extract = self.ai_config.get("model_extract", "gpt-4")
-        temperature = self.ai_config.get("temperature", 0.3)
-        max_tokens_extract = self.ai_config.get("max_tokens", 2048)
+        provider_name = config.get("provider_name")
+        model_extract = config.get("model_extract", "gpt-4")
+        temperature = config.get("temperature", 0.3)
+        max_tokens_extract = config.get("max_tokens", 2048)
+
+        logger.info(f"使用{client_type}数据提取客户端: {provider_name}")
 
         extracted_content = self.classifier.smart_content_extraction(email_data)
 
@@ -1223,7 +1497,7 @@ class EmailProcessor:
 
         try:
             if provider_name == "openai":
-                response = await self.ai_client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model_extract,
                     messages=messages,
                     temperature=temperature,
@@ -1233,8 +1507,8 @@ class EmailProcessor:
                 data = self._extract_json_from_text(raw_content)
 
             elif provider_name in ["deepseek", "custom"]:
-                if isinstance(self.ai_client, httpx.AsyncClient):
-                    response = await self.ai_client.post(
+                if isinstance(client, httpx.AsyncClient):
+                    response = await client.post(
                         "/v1/chat/completions",
                         json={
                             "model": model_extract,
@@ -1249,20 +1523,44 @@ class EmailProcessor:
                         "content"
                     ]
                     data = self._extract_json_from_text(raw_response_content)
+                elif isinstance(client, NoAuthCustomAPIProcessor):
+                    # 无认证自定义API
+                    email_data_for_extraction = {
+                        "subject": email_data.get("subject", ""),
+                        "body_text": extracted_content,
+                    }
+                    data = await client.extract_structured_data(
+                        email_data_for_extraction, "engineer", model_extract
+                    )
+            elif provider_name == "custom_no_auth":
+                if isinstance(client, NoAuthCustomAPIProcessor):
+                    email_data_for_extraction = {
+                        "subject": email_data.get("subject", ""),
+                        "body_text": extracted_content,
+                    }
+                    data = await client.extract_structured_data(
+                        email_data_for_extraction, "engineer", model_extract
+                    )
+            else:
+                raise ValueError(f"Unsupported extraction provider: {provider_name}")
 
             if data:
-                logger.info(f"AI提取的原始数据: {data}")
+                logger.info(f"{client_type}AI提取的原始数据: {data}")
                 # 使用更新的验证器创建EngineerStructured实例
                 engineer_data = EngineerStructured(**data)
-                logger.info(f"成功提取并验证工程师数据: {engineer_data.name}")
+                logger.info(
+                    f"{client_type}数据提取客户端成功提取并验证工程师数据: {engineer_data.name}"
+                )
                 return engineer_data
 
         except Exception as e:
-            logger.error(f"Error extracting engineer info: {e}")
+            logger.error(f"{client_type}数据提取客户端提取工程师信息失败: {e}")
             import traceback
 
             logger.error(f"Full traceback: {traceback.format_exc()}")
-            return None
+            raise  # 重新抛出异常以便上层处理fallback
+
+        return None
 
     async def save_engineer(
         self,
@@ -1359,7 +1657,7 @@ class EmailProcessor:
                     return None
 
     async def process_emails_for_tenant(self, tenant_id: str):
-        """特定テナントのメール処理を実行"""
+        """特定テナントのメール処理を実行 - 分离式AI版本"""
         settings_list = await self.get_smtp_settings(tenant_id)
 
         if not settings_list:
@@ -1372,7 +1670,7 @@ class EmailProcessor:
                 logger.info(f"Fetched {len(emails)} new emails for tenant {tenant_id}")
 
                 for email_data in emails:
-                    # 使用分类器进行邮件分类
+                    # 使用分离式AI分类器进行邮件分类
                     email_type = await self.classifier.classify_email(email_data)
                     logger.info(f"Email classified as: {email_type.value}")
 
@@ -1474,12 +1772,13 @@ class EmailProcessor:
 
 # バッチ処理用のメイン関数
 async def main():
-    """バッチ処理用のメイン関数"""
-    active_ai_config = Config.get_ai_config()
+    """バッチ処理用のメイン関数 - 分离式AI版本"""
 
-    processor = EmailProcessor(
-        db_config=Config.get_db_config(), ai_config=active_ai_config
-    )
+    # 打印分离式AI配置信息
+    logger.info("启动分离式AI邮件处理系统")
+    Config.print_ai_service_mapping_info()
+
+    processor = EmailProcessor(db_config=Config.get_db_config())
     await processor.initialize()
 
     try:
